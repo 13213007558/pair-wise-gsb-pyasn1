@@ -1,6 +1,15 @@
 Revision 0.7.0, released XX-XX-2026
 ---------------------------------------
 
+- Added iterative BER encoding entry point
+  ``pyasn1.codec.ber.encoder.StreamingEncoder`` that yields the
+  serialization chunk by chunk instead of materializing the whole octet
+  stream. Constructed types are emitted header-first, then component by
+  component, then terminated with the end-of-octets marker
+  (indefinite-length form). One-shot component sources (e.g. generators)
+  are accepted under a known ``componentType`; definite-length output
+  of such sources requires opting into bounded buffering via the new
+  ``maxBufferedOctets`` option.
 - Fixed OverflowError from BER/CER/DER length values that fit in the
   supported 8-octet length field but exceed the platform maximum readable
   size. Such oversized definite lengths are now rejected with PyAsn1Error.

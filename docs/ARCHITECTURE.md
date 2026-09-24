@@ -67,7 +67,7 @@ here.
 
 The package is thirty-two modules; four carry most of the weight:
 `type/univ.py` (~3,300 lines), `codec/ber/decoder.py` (~2,200),
-`codec/ber/encoder.py` (~960), `type/constraint.py` (~750).
+`codec/ber/encoder.py` (~1,280), `type/constraint.py` (~750).
 
 | Module | Role |
 |---|---|
@@ -84,7 +84,7 @@ The package is thirty-two modules; four carry most of the weight:
 | `type/error.py` | A *second* `ValueConstraintError`, the one actually raised |
 | `codec/streaming.py` | `asSeekableStream`, `CachingStreamWrapper`, `readFromStream`: the resumable-stream engine |
 | `codec/ber/decoder.py` | The base decoder: payload decoders, the state machine, every security limit |
-| `codec/ber/encoder.py` | The base encoder |
+| `codec/ber/encoder.py` | The base encoder, plus `StreamingEncoder` for iterative output |
 | `codec/ber/eoo.py` | The end-of-octets singleton |
 | `codec/cer/*`, `codec/der/*` | Derived codecs, sharing BER's objects by identity |
 | `codec/native/*` | Conversion to and from Python dicts, lists and scalars |
@@ -1043,6 +1043,25 @@ Tightening `**ignored` into strict validation is a breaking change:
 `SingleItemDecoder` constructor, and that pass-through works only because the
 constructor discards what it does not recognize.
 
+`StreamingEncoder` in `ber/encoder.py` is the iterative counterpart of
+`Encoder`: constructed identically (eager `SingleItemEncoder`, custom maps
+through the constructor), but `__call__` returns a generator yielding the
+serialization chunk by chunk rather than one `bytes` object. Only
+SEQUENCE OF/SET OF and chunked OCTET STRING values are streamed
+incrementally; every other type falls back to the whole-value
+`SingleItemEncoder` encoding yielded as a single chunk. With
+`defMode=False` a constructed value is emitted header-first, then component
+by component, then the end-of-octets marker, so a consumer that takes only
+the first chunk never triggers a full traversal of the component source.
+With `defMode=True` the encoded length must be known upfront, so components
+are encoded into a buffer first; a one-shot component source (anything where
+`iter(value) is value`, e.g. a generator) is rejected outright unless the
+caller opts into bounded buffering with `maxBufferedOctets`, which raises
+`PyAsn1Error` once the encoded content grows past the limit. A component
+that fails to encode mid-stream aborts the generator with a
+`PyAsn1Error` carrying the component index and the original exception
+chained; no end-of-octets marker is emitted past the failure point.
+
 ### The options channel
 
 The encoder's `options` dict is rebuilt by `**` expansion at each call
@@ -1882,4 +1901,3 @@ them as a drive-by; each needs its own dedicated change with tests.
   literal text. Not worth a churn-heavy rewrite mid-release; if ever fixed,
   do it as a dedicated pass verified with `tox -e docs`, since the file is
   compiled into the `-W` build.
-

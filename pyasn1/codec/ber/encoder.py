@@ -4,6 +4,7 @@
 # Copyright (c) 2005-2020, Ilya Etingof <etingof@gmail.com>
 # License: https://pyasn1.readthedocs.io/en/latest/license.html
 #
+import itertools
 import sys
 import warnings
 
@@ -17,7 +18,7 @@ from pyasn1.type import tag
 from pyasn1.type import univ
 from pyasn1.type import useful
 
-__all__ = ['Encoder', 'encode']
+__all__ = ['StreamingEncoder', 'Encoder', 'encode']
 
 LOG = debug.registerLoggee(__name__, flags=debug.DEBUG_ENCODER)
 
@@ -829,7 +830,7 @@ class SingleItemEncoder(object):
         self._tagMap = tagMap if tagMap is not _MISSING else self.TAG_MAP
         self._typeMap = typeMap if typeMap is not _MISSING else self.TYPE_MAP
 
-    def __call__(self, value, asn1Spec=None, **options):
+    def _getConcreteEncoder(self, value, asn1Spec):
         try:
             if asn1Spec is None:
                 typeId = value.typeId
@@ -839,19 +840,6 @@ class SingleItemEncoder(object):
         except AttributeError:
             raise error.PyAsn1Error('Value %r is not ASN.1 type instance '
                                     'and "asn1Spec" not given' % (value,))
-
-        if LOG:
-            LOG('encoder called in %sdef mode, chunk size %s for type %s, '
-                'value:\n%s' % (not options.get('defMode', True) and 'in' or '',
-                                options.get('maxChunkSize', 0),
-                                asn1Spec is None and value.prettyPrintType() or
-                                asn1Spec.prettyPrintType(), value))
-
-        if self.fixedDefLengthMode is not None:
-            options.update(defMode=self.fixedDefLengthMode)
-
-        if self.fixedChunkSize is not None:
-            options.update(maxChunkSize=self.fixedChunkSize)
 
         try:
             concreteEncoder = self._typeMap[typeId]
@@ -879,6 +867,24 @@ class SingleItemEncoder(object):
                 LOG('using value codec %s chosen by tagSet '
                     '%s' % (concreteEncoder.__class__.__name__, tagSet))
 
+        return concreteEncoder
+
+    def __call__(self, value, asn1Spec=None, **options):
+        concreteEncoder = self._getConcreteEncoder(value, asn1Spec)
+
+        if LOG:
+            LOG('encoder called in %sdef mode, chunk size %s for type %s, '
+                'value:\n%s' % (not options.get('defMode', True) and 'in' or '',
+                                options.get('maxChunkSize', 0),
+                                asn1Spec is None and value.prettyPrintType() or
+                                asn1Spec.prettyPrintType(), value))
+
+        if self.fixedDefLengthMode is not None:
+            options.update(defMode=self.fixedDefLengthMode)
+
+        if self.fixedChunkSize is not None:
+            options.update(maxChunkSize=self.fixedChunkSize)
+
         substrate = concreteEncoder.encode(value, asn1Spec, self, **options)
 
         if LOG:
@@ -900,6 +906,314 @@ class Encoder(object):
     def __call__(self, pyObject, asn1Spec=None, **options):
         return self._singleItemEncoder(
             pyObject, asn1Spec=asn1Spec, **options)
+
+
+class StreamingEncoder(object):
+    """Create an iterator that turns ASN.1 objects into BER octet-stream chunks.
+
+    On each iteration, produce the next piece of the BER serialization
+    of an ASN.1 object. Unlike :py:class:`Encoder`, the whole octet
+    stream is never materialized in memory: constructed types are
+    emitted header-first, then component by component, then terminated
+    with the end-of-octets marker (indefinite-length form).
+
+    Keyword Args
+    ------------
+    tagMap: :py:class:`dict`
+        Tag-to-encoder map to use instead of the default one
+
+    typeMap: :py:class:`dict`
+        Type-to-encoder map to use instead of the default one
+
+    Examples
+    --------
+    Encode a large SEQUENCE OF incrementally and write it to a socket
+
+    .. code-block:: pycon
+
+        >>> encoder = StreamingEncoder()
+        >>> for chunk in encoder(sequenceOf, defMode=False):
+        ...     sock.sendall(chunk)
+    """
+
+    SINGLE_ITEM_ENCODER = SingleItemEncoder
+
+    def __init__(self, tagMap=_MISSING, typeMap=_MISSING, **options):
+        self._singleItemEncoder = self.SINGLE_ITEM_ENCODER(
+            tagMap=tagMap, typeMap=typeMap, **options
+        )
+
+    def __call__(self, value, asn1Spec=None, **options):
+        """Return an iterator turning ASN.1 object into BER octet-stream chunks.
+
+        Parameters
+        ----------
+        value: either a Python or pyasn1 object (e.g. :py:class:`~pyasn1.type.base.PyAsn1Item` derivative)
+            A Python or pyasn1 object to encode. If Python object is given,
+            `asn1Spec` parameter is required to guide the encoding process.
+            An iterable of component values (possibly a one-shot generator)
+            is also accepted when `asn1Spec` is a SEQUENCE OF/SET OF schema
+            with a known `componentType`.
+
+        Keyword Args
+        ------------
+        asn1Spec:
+            Optional ASN.1 schema or value object e.g. :py:class:`~pyasn1.type.base.PyAsn1Item` derivative
+
+        defMode: :py:class:`bool`
+            If :obj:`False`, produces indefinite length encoding, emitting
+            the header, the components and the end-of-octets marker
+            incrementally. If :obj:`True` (default), the encoded length
+            must be known upfront: components are encoded into an in-memory
+            buffer first. A one-shot component source (e.g. a generator)
+            is rejected in this mode unless `maxBufferedOctets` is given.
+
+        maxChunkSize: :py:class:`int`
+            Maximum chunk size in chunked encoding mode (0 denotes unlimited
+            chunk size)
+
+        maxBufferedOctets: :py:class:`int`
+            Maximum number of encoded content octets to buffer when
+            definite-length output is requested for a one-shot component
+            source. Encoding fails with :py:class:`~pyasn1.error.PyAsn1Error`
+            once the buffer would grow past this limit.
+
+        Yields
+        ------
+        : :py:class:`bytes`
+            Consecutive pieces of the BER octet stream. Concatenating all
+            pieces yields exactly what :py:class:`Encoder` would return
+            for the same input and options.
+
+        Raises
+        ------
+        ~pyasn1.error.PyAsn1Error
+            On encoding errors. A component that fails to encode mid-stream
+            aborts the iteration: the original exception is chained and the
+            component position is reported, no end-of-octets marker is
+            emitted afterwards.
+        """
+        singleItemEncoder = self._singleItemEncoder
+
+        if singleItemEncoder.fixedDefLengthMode is not None:
+            options.update(defMode=singleItemEncoder.fixedDefLengthMode)
+
+        if singleItemEncoder.fixedChunkSize is not None:
+            options.update(maxChunkSize=singleItemEncoder.fixedChunkSize)
+
+        return self._encode(value, asn1Spec, options)
+
+    def _encode(self, value, asn1Spec, options):
+        concreteEncoder = self._singleItemEncoder._getConcreteEncoder(
+            value, asn1Spec)
+
+        if isinstance(concreteEncoder, SequenceOfEncoder):
+            for chunk in self._encodeSequenceOf(
+                    value, asn1Spec, concreteEncoder, options):
+                yield chunk
+
+        elif (isinstance(concreteEncoder, OctetStringEncoder) and
+                not isinstance(concreteEncoder, AnyEncoder)):
+            for chunk in self._encodeOctetString(
+                    value, asn1Spec, concreteEncoder, options):
+                yield chunk
+
+        else:
+            yield self._singleItemEncoder(value, asn1Spec, **options)
+
+    def _encodeComponents(self, source, componentSpec, wrapType, options):
+        singleItemEncoder = self._singleItemEncoder
+
+        for idx, component in enumerate(source):
+            try:
+                if (wrapType is not None and
+                        not wrapType.isSameTypeWith(component)):
+                    # wrap encoded value with wrapper container (e.g. ANY)
+                    chunk = singleItemEncoder(
+                        component, componentSpec, **options)
+                    chunk = singleItemEncoder(chunk, wrapType, **options)
+
+                    if LOG:
+                        LOG('wrapped with wrap type %r' % (wrapType,))
+
+                    yield chunk
+
+                else:
+                    for chunk in self._encode(
+                            component, componentSpec, dict(options)):
+                        yield chunk
+
+            except error.PyAsn1Error as exc:
+                raise error.PyAsn1Error(
+                    'Error encoding component #%d: %s' % (idx, exc))
+
+    def _encodeSequenceOf(self, value, asn1Spec, concreteEncoder, options):
+        if asn1Spec is None:
+            inconsistency = value.isInconsistent
+            if inconsistency:
+                raise error.PyAsn1Error(
+                    f"ASN.1 object {value.__class__.__name__} is inconsistent")
+
+            componentSpec = None
+            tagSet = value.tagSet
+
+        else:
+            componentSpec = asn1Spec.componentType
+            tagSet = asn1Spec.tagSet
+
+        wrapType = options.pop('wrapType', None)
+
+        defMode = options.get('defMode', True)
+
+        if not concreteEncoder.supportIndefLenMode:
+            defMode = True
+
+        if defMode:
+            for chunk in self._encodeSequenceOfDefinite(
+                    value, componentSpec, wrapType, tagSet,
+                    concreteEncoder, options):
+                yield chunk
+
+        else:
+            for chunk in self._encodeSequenceOfIndefinite(
+                    value, componentSpec, wrapType, tagSet,
+                    concreteEncoder, options):
+                yield chunk
+
+    def _encodeSequenceOfDefinite(self, value, componentSpec, wrapType,
+                                  tagSet, concreteEncoder, options):
+        maxBufferedOctets = options.get('maxBufferedOctets')
+
+        if iter(value) is value and maxBufferedOctets is None:
+            raise error.PyAsn1Error(
+                'Cannot encode a one-shot component source in '
+                'definite-length mode: the encoded length must be known '
+                'upfront. Use defMode=False or pass maxBufferedOctets '
+                'to allow bounded buffering')
+
+        chunks = []
+        contentLength = 0
+
+        for chunk in self._encodeComponents(
+                value, componentSpec, wrapType, options):
+            contentLength += len(chunk)
+
+            if (maxBufferedOctets is not None and
+                    contentLength > maxBufferedOctets):
+                raise error.PyAsn1Error(
+                    'Encoded content of %d octets exceeds '
+                    'maxBufferedOctets (%d)' % (
+                        contentLength, maxBufferedOctets))
+
+            chunks.append(chunk)
+
+        if not chunks and options.get('ifNotEmpty', False):
+            return
+
+        headers = []
+
+        for singleTag in tagSet.superTags:
+            header = concreteEncoder.encodeTag(singleTag, True)
+            header += concreteEncoder.encodeLength(contentLength, True)
+            headers.append(bytes(header))
+            contentLength += len(header)
+
+        for header in reversed(headers):
+            yield header
+
+        for chunk in chunks:
+            yield chunk
+
+    def _encodeSequenceOfIndefinite(self, value, componentSpec, wrapType,
+                                    tagSet, concreteEncoder, options):
+        if options.get('ifNotEmpty', False):
+            source = iter(value)
+
+            try:
+                firstComponent = next(source)
+
+            except StopIteration:
+                return
+
+            source = itertools.chain((firstComponent,), source)
+
+        else:
+            source = value
+
+        for singleTag in reversed(tagSet.superTags):
+            header = concreteEncoder.encodeTag(singleTag, True)
+            header += concreteEncoder.encodeLength(0, False)
+            yield bytes(header)
+
+        for chunk in self._encodeComponents(
+                source, componentSpec, wrapType, options):
+            yield chunk
+
+        for _ in tagSet.superTags:
+            yield concreteEncoder.eooOctetsSubstrate
+
+    def _encodeOctetString(self, value, asn1Spec, concreteEncoder, options):
+        maxChunkSize = options.get('maxChunkSize', 0)
+
+        if asn1Spec is None:
+            substrate = value.asOctets()
+
+        elif not isinstance(value, bytes):
+            substrate = asn1Spec.clone(value).asOctets()
+
+        else:
+            substrate = value
+
+        if (not maxChunkSize or len(substrate) <= maxChunkSize or
+                options.get('defMode', True) or
+                not concreteEncoder.supportIndefLenMode):
+            yield self._singleItemEncoder(value, asn1Spec, **options)
+            return
+
+        # strip off explicit tags for inner chunks
+        if asn1Spec is None:
+            baseTag = value.tagSet.baseTag
+
+            if baseTag:
+                chunkSpec = value.clone(tagSet=tag.TagSet(baseTag, baseTag))
+
+            else:
+                chunkSpec = value.clone(tagSet=tag.TagSet())
+
+            tagSet = value.tagSet
+
+        elif not isinstance(value, bytes):
+            baseTag = asn1Spec.tagSet.baseTag
+
+            if baseTag:
+                chunkSpec = asn1Spec.clone(tagSet=tag.TagSet(baseTag, baseTag))
+
+            else:
+                chunkSpec = asn1Spec.clone(tagSet=tag.TagSet())
+
+            tagSet = asn1Spec.tagSet
+
+        else:
+            chunkSpec = asn1Spec
+            tagSet = asn1Spec.tagSet
+
+        for singleTag in reversed(tagSet.superTags):
+            header = concreteEncoder.encodeTag(singleTag, True)
+            header += concreteEncoder.encodeLength(0, False)
+            yield bytes(header)
+
+        pos = 0
+
+        while True:
+            chunk = value[pos:pos + maxChunkSize]
+            if not chunk:
+                break
+
+            yield self._singleItemEncoder(chunk, chunkSpec, **options)
+            pos += maxChunkSize
+
+        for _ in tagSet.superTags:
+            yield concreteEncoder.eooOctetsSubstrate
 
 
 #: Turns ASN.1 object into BER octet stream.

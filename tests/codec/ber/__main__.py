@@ -8,6 +8,7 @@ import unittest
 
 suite = unittest.TestLoader().loadTestsFromNames(
     ['tests.codec.ber.test_encoder.suite',
+     'tests.codec.ber.test_streaming_encoder.suite',
      'tests.codec.ber.test_decoder.suite']
 )
 
