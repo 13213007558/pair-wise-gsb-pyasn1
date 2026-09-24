@@ -656,6 +656,192 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
     def _getComponentPositionByType(self, asn1Object, tagSet, idx):
         raise NotImplementedError
 
+    @staticmethod
+    def _formatOpenTypePath(path):
+        chunks = []
+
+        for segment in path:
+            if isinstance(segment, int):
+                chunks.append('[%d]' % segment)
+
+            elif chunks:
+                chunks.append('.' + segment)
+
+            else:
+                chunks.append(segment)
+
+        return ''.join(chunks)
+
+    @staticmethod
+    def _extendOpenTypePath(options, segment):
+        if options.get('openTypeResolver') is None:
+            return options
+
+        path = options.get('_openTypePath', ())
+
+        return dict(options, _openTypePath=path + (segment,))
+
+    def _lookupOpenType(self, namedType, asn1Object, governingValue,
+                        openTypes):
+        try:
+            return openTypes[governingValue]
+
+        except KeyError:
+            pass
+
+        if LOG:
+            LOG('default open types map of component '
+                '"%s.%s" governed by component "%s.%s"'
+                ':' % (asn1Object.__class__.__name__,
+                       namedType.name,
+                       asn1Object.__class__.__name__,
+                       namedType.openType.name))
+
+            for k, v in namedType.openType.items():
+                LOG('%s -> %r' % (k, v))
+
+        try:
+            return namedType.openType[governingValue]
+
+        except KeyError:
+            return None
+
+    def _decodeOpenTypeComponents(self, asn1Object, namedTypes, decodeFun,
+                                  options, allowEoo=False):
+        """Re-decode open type components of a fully decoded structure.
+
+        Runs once the parent structure has been read in full, so the
+        governing (control) component is available even when it is
+        positioned after the ANY component.
+
+        Resolution sources, in decreasing precedence:
+
+        1. the openTypeResolver callable from *options*, called once
+           per ANY value as resolver(namedType, parentValue, path)
+           and expected to return an ASN.1 schema object or None to
+           fall through to the maps
+        2. the openTypes map from *options*
+        3. the field-local namedType.openType map
+
+        Unresolvable components are left as raw ANY, unless
+        strictOpenTypes is set in *options*.
+        """
+        openTypes = options.get('openTypes', {})
+        resolver = options.get('openTypeResolver')
+        strict = options.get('strictOpenTypes', False)
+        path = options.get('_openTypePath', ())
+
+        if LOG:
+            LOG('user-specified open types map:')
+
+            for k, v in openTypes.items():
+                LOG('%s -> %r' % (k, v))
+
+        if not (openTypes or resolver is not None
+                or options.get('decodeOpenTypes', False)):
+            return
+
+        for idx, namedType in enumerate(namedTypes.namedTypes):
+            if not namedType.openType:
+                continue
+
+            if namedType.isOptional and not asn1Object.getComponentByPosition(idx).isValue:
+                continue
+
+            governingValue = asn1Object.getComponentByName(
+                namedType.openType.name
+            )
+
+            fieldPath = path + (namedType.name,)
+
+            containerValue = asn1Object.getComponentByPosition(idx)
+
+            if containerValue.typeId in (
+                    univ.SetOf.typeId, univ.SequenceOf.typeId):
+                targets = [
+                    (position, fieldPath + (position,))
+                    for position in range(len(containerValue))
+                ]
+
+            else:
+                targets = [(None, fieldPath)]
+
+            mapOpenType = _MISSING
+
+            for position, targetPath in targets:
+
+                openType = None
+
+                if resolver is not None:
+                    try:
+                        openType = resolver(
+                            namedType, asn1Object, targetPath)
+
+                    except Exception as exc:
+                        raise error.PyAsn1Error(
+                            'Open type resolver failed at %s: %s' % (
+                                self._formatOpenTypePath(targetPath), exc))
+
+                if openType is None:
+                    if mapOpenType is _MISSING:
+                        mapOpenType = self._lookupOpenType(
+                            namedType, asn1Object, governingValue, openTypes)
+
+                    openType = mapOpenType
+
+                if openType is None:
+                    if strict:
+                        raise error.PyAsn1Error(
+                            'Failed to resolve open type of component '
+                            '"%s" at %s by governing value %r' % (
+                                namedType.name,
+                                self._formatOpenTypePath(targetPath),
+                                governingValue))
+
+                    if LOG:
+                        LOG('failed to resolve open type by governing '
+                            'value %r' % (governingValue,))
+
+                    break
+
+                if LOG:
+                    LOG('resolved open type %r by governing '
+                        'value %r' % (openType, governingValue))
+
+                if position is None:
+                    stream = asSeekableStream(containerValue.asOctets())
+
+                else:
+                    stream = asSeekableStream(containerValue[position].asOctets())
+
+                decodeOptions = dict(options, _openTypePath=targetPath)
+
+                if allowEoo:
+                    decodeOptions['allowEoo'] = True
+
+                    for component in decodeFun(
+                            stream, asn1Spec=openType, **decodeOptions):
+                        if isinstance(component, SubstrateUnderrunError):
+                            yield component
+
+                        if component is eoo.endOfOctets:
+                            break
+
+                        if position is None:
+                            asn1Object.setComponentByPosition(idx, component)
+
+                else:
+                    for component in decodeFun(
+                            stream, asn1Spec=openType, **decodeOptions):
+                        if isinstance(component, SubstrateUnderrunError):
+                            yield component
+
+                if position is not None:
+                    containerValue[position] = component
+
+                elif not allowEoo:
+                    asn1Object.setComponentByPosition(idx, component)
+
     def _decodeComponentsSchemaless(
             self, substrate, tagSet=None, decodeFun=None,
             length=None, **options):
@@ -793,7 +979,19 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                             'Excessive components decoded at %r' % (asn1Spec,)
                         )
 
-                for component in decodeFun(substrate, componentType, **options):
+                if (namedTypes and not isSetType
+                        and idx < len(namedTypes)
+                        and (isDeterministic
+                             or not (namedTypes[idx].isOptional
+                                     or namedTypes[idx].isDefaulted))):
+                    decodeOptions = self._extendOpenTypePath(
+                        options, namedTypes[idx].name)
+
+                else:
+                    decodeOptions = options
+
+                for component in decodeFun(
+                        substrate, componentType, **decodeOptions):
                     if isinstance(component, SubstrateUnderrunError):
                         yield component
 
@@ -822,82 +1020,11 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                         'ASN.1 object %s has uninitialized '
                         'components' % asn1Object.__class__.__name__)
 
-                if  namedTypes.hasOpenTypes:
-
-                    openTypes = options.get('openTypes', {})
-
-                    if LOG:
-                        LOG('user-specified open types map:')
-
-                        for k, v in openTypes.items():
-                            LOG('%s -> %r' % (k, v))
-
-                    if openTypes or options.get('decodeOpenTypes', False):
-
-                        for idx, namedType in enumerate(namedTypes.namedTypes):
-                            if not namedType.openType:
-                                continue
-
-                            if namedType.isOptional and not asn1Object.getComponentByPosition(idx).isValue:
-                                continue
-
-                            governingValue = asn1Object.getComponentByName(
-                                namedType.openType.name
-                            )
-
-                            try:
-                                openType = openTypes[governingValue]
-
-                            except KeyError:
-
-                                if LOG:
-                                    LOG('default open types map of component '
-                                        '"%s.%s" governed by component "%s.%s"'
-                                        ':' % (asn1Object.__class__.__name__,
-                                               namedType.name,
-                                               asn1Object.__class__.__name__,
-                                               namedType.openType.name))
-
-                                    for k, v in namedType.openType.items():
-                                        LOG('%s -> %r' % (k, v))
-
-                                try:
-                                    openType = namedType.openType[governingValue]
-
-                                except KeyError:
-                                    if LOG:
-                                        LOG('failed to resolve open type by governing '
-                                            'value %r' % (governingValue,))
-                                    continue
-
-                            if LOG:
-                                LOG('resolved open type %r by governing '
-                                    'value %r' % (openType, governingValue))
-
-                            containerValue = asn1Object.getComponentByPosition(idx)
-
-                            if containerValue.typeId in (
-                                    univ.SetOf.typeId, univ.SequenceOf.typeId):
-
-                                for pos, containerElement in enumerate(
-                                        containerValue):
-
-                                    stream = asSeekableStream(containerValue[pos].asOctets())
-
-                                    for component in decodeFun(stream, asn1Spec=openType, **options):
-                                        if isinstance(component, SubstrateUnderrunError):
-                                            yield component
-
-                                    containerValue[pos] = component
-
-                            else:
-                                stream = asSeekableStream(asn1Object.getComponentByPosition(idx).asOctets())
-
-                                for component in decodeFun(stream, asn1Spec=openType, **options):
-                                    if isinstance(component, SubstrateUnderrunError):
-                                        yield component
-
-                                asn1Object.setComponentByPosition(idx, component)
+                if namedTypes.hasOpenTypes:
+                    for component in self._decodeOpenTypeComponents(
+                            asn1Object, namedTypes, decodeFun, options):
+                        if isinstance(component, SubstrateUnderrunError):
+                            yield component
 
             else:
                 inconsistency = asn1Object.isInconsistent
@@ -914,7 +1041,10 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
             idx = 0
 
             while substrate.tell() - original_position < length:
-                for component in decodeFun(substrate, componentType, **options):
+                decodeOptions = self._extendOpenTypePath(options, idx)
+
+                for component in decodeFun(
+                        substrate, componentType, **decodeOptions):
                     if isinstance(component, SubstrateUnderrunError):
                         yield component
 
@@ -1005,7 +1135,19 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                             'Excessive components decoded at %r' % (asn1Object,)
                         )
 
-                for component in decodeFun(substrate, asn1Spec, allowEoo=True, **options):
+                if (namedTypes and not isSetType
+                        and idx < len(namedTypes)
+                        and (isDeterministic
+                             or not (namedTypes[idx].isOptional
+                                     or namedTypes[idx].isDefaulted))):
+                    decodeOptions = self._extendOpenTypePath(
+                        options, namedTypes[idx].name)
+
+                else:
+                    decodeOptions = options
+
+                for component in decodeFun(
+                        substrate, asn1Spec, allowEoo=True, **decodeOptions):
 
                     if isinstance(component, SubstrateUnderrunError):
                         yield component
@@ -1042,88 +1184,11 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                         'components' % asn1Object.__class__.__name__)
 
                 if namedTypes.hasOpenTypes:
-
-                    openTypes = options.get('openTypes', {})
-
-                    if LOG:
-                        LOG('user-specified open types map:')
-
-                        for k, v in openTypes.items():
-                            LOG('%s -> %r' % (k, v))
-
-                    if openTypes or options.get('decodeOpenTypes', False):
-
-                        for idx, namedType in enumerate(namedTypes.namedTypes):
-                            if not namedType.openType:
-                                continue
-
-                            if namedType.isOptional and not asn1Object.getComponentByPosition(idx).isValue:
-                                continue
-
-                            governingValue = asn1Object.getComponentByName(
-                                namedType.openType.name
-                            )
-
-                            try:
-                                openType = openTypes[governingValue]
-
-                            except KeyError:
-
-                                if LOG:
-                                    LOG('default open types map of component '
-                                        '"%s.%s" governed by component "%s.%s"'
-                                        ':' % (asn1Object.__class__.__name__,
-                                               namedType.name,
-                                               asn1Object.__class__.__name__,
-                                               namedType.openType.name))
-
-                                    for k, v in namedType.openType.items():
-                                        LOG('%s -> %r' % (k, v))
-
-                                try:
-                                    openType = namedType.openType[governingValue]
-
-                                except KeyError:
-                                    if LOG:
-                                        LOG('failed to resolve open type by governing '
-                                            'value %r' % (governingValue,))
-                                    continue
-
-                            if LOG:
-                                LOG('resolved open type %r by governing '
-                                    'value %r' % (openType, governingValue))
-
-                            containerValue = asn1Object.getComponentByPosition(idx)
-
-                            if containerValue.typeId in (
-                                    univ.SetOf.typeId, univ.SequenceOf.typeId):
-
-                                for pos, containerElement in enumerate(
-                                        containerValue):
-
-                                    stream = asSeekableStream(containerValue[pos].asOctets())
-
-                                    for component in decodeFun(stream, asn1Spec=openType,
-                                                               **dict(options, allowEoo=True)):
-                                        if isinstance(component, SubstrateUnderrunError):
-                                            yield component
-
-                                        if component is eoo.endOfOctets:
-                                            break
-
-                                    containerValue[pos] = component
-
-                            else:
-                                stream = asSeekableStream(asn1Object.getComponentByPosition(idx).asOctets())
-                                for component in decodeFun(stream, asn1Spec=openType,
-                                                           **dict(options, allowEoo=True)):
-                                    if isinstance(component, SubstrateUnderrunError):
-                                        yield component
-
-                                    if component is eoo.endOfOctets:
-                                        break
-
-                                    asn1Object.setComponentByPosition(idx, component)
+                    for component in self._decodeOpenTypeComponents(
+                            asn1Object, namedTypes, decodeFun, options,
+                            allowEoo=True):
+                        if isinstance(component, SubstrateUnderrunError):
+                            yield component
 
                 else:
                     inconsistency = asn1Object.isInconsistent
@@ -1141,8 +1206,10 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
             while True:
 
+                decodeOptions = self._extendOpenTypePath(options, idx)
+
                 for component in decodeFun(
-                        substrate, componentType, allowEoo=True, **options):
+                        substrate, componentType, allowEoo=True, **decodeOptions):
 
                     if isinstance(component, SubstrateUnderrunError):
                         yield component

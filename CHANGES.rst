@@ -1,6 +1,15 @@
 Revision 0.7.0, released XX-XX-2026
 ---------------------------------------
 
+- Added contextual open type resolution to the BER/CER/DER decoders. The
+  new ``openTypeResolver`` decode option takes a callable that is invoked
+  once per ANY value as ``resolver(namedType, parentValue, path)`` and
+  returns the concrete ASN.1 schema, taking precedence over the
+  ``openTypes`` call-level map and the field-local ``namedType.openType``
+  map. This allows the same discriminator value to denote different ANY
+  types in different parent structures. The new ``strictOpenTypes``
+  decode option turns unresolvable open types, previously left as raw
+  ANY, into PyAsn1Error
 - Fixed OverflowError from BER/CER/DER length values that fit in the
   supported 8-octet length field but exceed the platform maximum readable
   size. Such oversized definite lengths are now rejected with PyAsn1Error.

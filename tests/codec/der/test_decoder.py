@@ -242,6 +242,50 @@ class SequenceDecoderWithExplicitlyTaggedOpenTypesTestCase(BaseTestCase):
         assert s[1] == univ.OctetString(hexValue='02010C')
 
 
+class SequenceDecoderWithOpenTypeResolverTestCase(BaseTestCase):
+    def setUp(self):
+        BaseTestCase.setUp(self)
+
+        self.s = univ.Sequence(
+            componentType=namedtype.NamedTypes(
+                namedtype.NamedType('id', univ.Integer()),
+                namedtype.NamedType('blob', univ.Any(),
+                                    openType=opentype.OpenType('id', {}))
+            )
+        )
+
+    def testDecodeWithResolver(self):
+        def resolver(namedType, parentValue, path):
+            if parentValue['id'] == 1:
+                return univ.Integer()
+
+            return None
+
+        s, r = decoder.decode(
+            bytes((48, 6, 2, 1, 1, 2, 1, 12)), asn1Spec=self.s,
+            openTypeResolver=resolver
+        )
+        assert not r
+        assert isinstance(s['blob'], univ.Integer)
+        assert s['blob'] == 12
+
+    def testDecodeWithResolverUnknownType(self):
+        def resolver(namedType, parentValue, path):
+            return None
+
+        try:
+            decoder.decode(
+                bytes((48, 6, 2, 1, 1, 2, 1, 12)), asn1Spec=self.s,
+                openTypeResolver=resolver, strictOpenTypes=True
+            )
+
+        except PyAsn1Error as exc:
+            assert 'blob' in str(exc)
+
+        else:
+            assert False, 'unresolved open type tolerated'
+
+
 class SequenceDecoderWithUnaggedSetOfOpenTypesTestCase(BaseTestCase):
     def setUp(self):
         openType = opentype.OpenType(

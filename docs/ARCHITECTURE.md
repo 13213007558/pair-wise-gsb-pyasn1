@@ -1599,15 +1599,37 @@ probe restores the position either way, but it must stay before
 
 Open types are the schema layer above `ANY`: a container with `hasOpenTypes`
 decodes normally first, leaving the open component as raw octets, then,
-under `openTypes=...` or `decodeOpenTypes=True`, resolves the real type from
-the governing component and re-decodes on a fresh `BytesIO` built from the
-component's octets (the `asSeekableStream(...asOctets())` calls in
-`ConstructedPayloadDecoderBase.valueDecoder` and `indefLenValueDecoder`).
-The fresh stream gives the payload its own position space; `**options` still
-crosses that boundary, so the nesting counter keeps counting. Resolution
-failure is non-fatal: logged and skipped, raw octets left in place (the
-inner `except KeyError` around the `namedType.openType[governingValue]`
-lookup).
+under `openTypes=...`, `openTypeResolver=...` or `decodeOpenTypes=True`,
+resolves the real type and re-decodes on a fresh `BytesIO` built from the
+component's octets. Both the definite- and indefinite-length paths funnel
+through a single generator,
+`ConstructedPayloadDecoderBase._decodeOpenTypeComponents`, which runs only
+after the parent structure has been read in full, so a governing (control)
+component positioned *after* the ANY component is already decoded when
+resolution happens. The fresh stream gives the payload its own position
+space; `**options` still crosses that boundary, so the nesting counter
+keeps counting.
+
+Resolution sources, in decreasing precedence: the `openTypeResolver`
+callable, the call-level `openTypes` map, then the field-local
+`namedType.openType` map (the `KeyError` fallbacks live in
+`ConstructedPayloadDecoderBase._lookupOpenType`). The resolver is called
+exactly once per ANY value as `resolver(namedType, parentValue, path)`
+and returns a schema object or `None` to fall through to the maps; for a
+`SET OF`/`SEQUENCE OF` open component it is invoked once per element.
+The `path` argument is a tuple of field names and container indices
+locating the ANY value from the top-level decode root (formatted for error
+messages by `_formatOpenTypePath`). It travels in
+`options['_openTypePath']`, extended by `_extendOpenTypePath` as the
+decoder descends into named components and container elements, so recursive
+open types resolve against the full nesting context and interleaved decodes
+of different parent structures never share resolution state. A resolver
+exception is re-raised as `PyAsn1Error` carrying that path. Resolution
+failure is otherwise non-fatal: logged and skipped, raw octets left in
+place — unless `strictOpenTypes=True`, which makes an unresolvable
+component a `PyAsn1Error`. The schema object a resolver returns is
+treated as read-only shared state: the decoder clones it on re-decode and
+never caches resolutions back into the schema or the `OpenType` maps.
 
 ### Bounding nesting depth
 
@@ -1645,19 +1667,21 @@ test, no warning, no change on well-formed input. The mitigation just stops
 applying to that subtree, and no existing test detects the loss
 (`NestingDepthLimitTestCase.testNoRecursionError` in
 `tests/codec/ber/test_decoder.py` exercises only the plain constructed
-path). All 20 `decodeFun` call sites in `ber/decoder.py` forward the dict,
+path). All 18 `decodeFun` call sites in `ber/decoder.py` forward the dict,
 either as `**options` or as `**dict(options, allowEoo=True)` (which
 preserves the key). The open-type re-entries (the
 `decodeFun(stream, asn1Spec=openType, ...)` calls in
-`ConstructedPayloadDecoderBase.valueDecoder` and `indefLenValueDecoder`)
+`ConstructedPayloadDecoderBase._decodeOpenTypeComponents`)
 matter most: they cross into a brand-new stream
 ([Deferred typing: ANY and open types](#deferred-typing-any-and-open-types))
 and look the most natural to "clean up".
 
 `options` is simultaneously the nesting counter, the `context` attached to
 `SubstrateUnderrunError`, the `asn1Object` back-reference carrier
-(`AbstractPayloadDecoder._passAsn1Object`), the `allowEoo` channel and the
-user-option pass-through. Adding a key is cheap; removing or renaming one is
+(`AbstractPayloadDecoder._passAsn1Object`), the `allowEoo` channel, the
+open-type resolution path (`_openTypePath`, see [Deferred typing: ANY and
+open types](#deferred-typing-any-and-open-types)) and the user-option
+pass-through. Adding a key is cheap; removing or renaming one is
 not. A stack-frame count in place of the counter re-introduces
 `RecursionError` and breaks `testWithSchema` in the same class and the
 `NestingDepthLimitTestCase` mirrors in `tests/codec/cer/test_decoder.py`
@@ -1882,4 +1906,3 @@ them as a drive-by; each needs its own dedicated change with tests.
   literal text. Not worth a churn-heavy rewrite mid-release; if ever fixed,
   do it as a dedicated pass verified with `tox -e docs`, since the file is
   compiled into the `-W` build.
-

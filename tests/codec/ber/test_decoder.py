@@ -1516,6 +1516,366 @@ class SequenceDecoderWithExplicitlyTaggedSetOfOpenTypesTestCase(BaseTestCase):
         assert s[1][0] == univ.OctetString(hexValue='02010C')
 
 
+class SequenceDecoderWithOpenTypeResolverTestCase(BaseTestCase):
+    def setUp(self):
+        BaseTestCase.setUp(self)
+
+        # two schemas whose discriminators are both 1, yet their ANY
+        # components mean different types
+        self.openTypeA = opentype.OpenType('id', {1: univ.Integer()})
+        self.openTypeB = opentype.OpenType('id', {1: univ.Boolean()})
+
+        self.schemaA = univ.Sequence(
+            componentType=namedtype.NamedTypes(
+                namedtype.NamedType('id', univ.Integer()),
+                namedtype.NamedType('blob', univ.Any(),
+                                    openType=self.openTypeA)
+            )
+        )
+        self.schemaB = univ.Sequence(
+            componentType=namedtype.NamedTypes(
+                namedtype.NamedType('id', univ.Integer()),
+                namedtype.NamedType('blob', univ.Any(),
+                                    openType=self.openTypeB)
+            )
+        )
+
+    @staticmethod
+    def _encode(schema, idValue, payload):
+        value = schema.clone()
+        value['id'] = idValue
+        value['blob'] = univ.Any(encoder.encode(payload))
+        return encoder.encode(value)
+
+    def testResolverDispatchesByPath(self):
+        outer = univ.Sequence(
+            componentType=namedtype.NamedTypes(
+                namedtype.NamedType('a', self.schemaA),
+                namedtype.NamedType('b', self.schemaB)
+            )
+        )
+
+        def resolver(namedType, parentValue, path):
+            if path == ('a', 'blob'):
+                return univ.Integer()
+
+            if path == ('b', 'blob'):
+                return univ.Boolean()
+
+            return None
+
+        valueA = self.schemaA.clone()
+        valueA['id'] = 1
+        valueA['blob'] = univ.Any(encoder.encode(univ.Integer(5)))
+
+        valueB = self.schemaB.clone()
+        valueB['id'] = 1
+        valueB['blob'] = univ.Any(encoder.encode(univ.Boolean(True)))
+
+        value = outer.clone()
+        value['a'] = valueA
+        value['b'] = valueB
+
+        s, r = decoder.decode(
+            encoder.encode(value), asn1Spec=outer, openTypeResolver=resolver
+        )
+        assert not r
+        assert s['a']['id'] == 1
+        assert isinstance(s['a']['blob'], univ.Integer)
+        assert s['a']['blob'] == 5
+        assert s['b']['id'] == 1
+        assert isinstance(s['b']['blob'], univ.Boolean)
+        assert s['b']['blob'] == univ.Boolean(True)
+
+    def testInterleavedDecodingDoesNotCrossTalk(self):
+        registry = {
+            id(self.openTypeA): univ.Integer(),
+            id(self.openTypeB): univ.Boolean(),
+        }
+
+        def resolver(namedType, parentValue, path):
+            return registry.get(id(namedType.openType))
+
+        substrateA = self._encode(self.schemaA, 1, univ.Integer(5))
+        substrateB = self._encode(self.schemaB, 1, univ.Boolean(True))
+
+        for _round in range(3):
+            a, r = decoder.decode(
+                substrateA, asn1Spec=self.schemaA, openTypeResolver=resolver
+            )
+            assert not r
+            assert isinstance(a['blob'], univ.Integer)
+            assert a['blob'] == 5
+
+            b, r = decoder.decode(
+                substrateB, asn1Spec=self.schemaB, openTypeResolver=resolver
+            )
+            assert not r
+            assert isinstance(b['blob'], univ.Boolean)
+            assert b['blob'] == univ.Boolean(True)
+
+    def testResolverTakesPrecedenceOverMaps(self):
+        substrate = self._encode(self.schemaB, 1, univ.Boolean(True))
+
+        def resolver(namedType, parentValue, path):
+            return univ.Any()
+
+        s, r = decoder.decode(
+            substrate, asn1Spec=self.schemaB,
+            openTypes={1: univ.Boolean()},
+            openTypeResolver=resolver
+        )
+        assert not r
+        assert isinstance(s['blob'], univ.Any)
+        assert not isinstance(s['blob'], univ.Boolean)
+
+    def testResolverFallThroughToCallLevelMap(self):
+        substrate = self._encode(self.schemaB, 1, univ.Boolean(True))
+
+        def resolver(namedType, parentValue, path):
+            return None
+
+        s, r = decoder.decode(
+            substrate, asn1Spec=self.schemaB,
+            openTypes={1: univ.Any()},
+            openTypeResolver=resolver
+        )
+        assert not r
+        assert isinstance(s['blob'], univ.Any)
+        assert not isinstance(s['blob'], univ.Boolean)
+
+    def testResolverFallThroughToLocalMap(self):
+        substrate = self._encode(self.schemaB, 1, univ.Boolean(True))
+
+        def resolver(namedType, parentValue, path):
+            return None
+
+        s, r = decoder.decode(
+            substrate, asn1Spec=self.schemaB, openTypeResolver=resolver
+        )
+        assert not r
+        assert isinstance(s['blob'], univ.Boolean)
+        assert s['blob'] == univ.Boolean(True)
+
+    def testGoverningFieldAfterAny(self):
+        schema = univ.Sequence(
+            componentType=namedtype.NamedTypes(
+                namedtype.NamedType('blob', univ.Any(),
+                                    openType=opentype.OpenType('id', {})),
+                namedtype.NamedType('id', univ.Integer())
+            )
+        )
+
+        def resolver(namedType, parentValue, path):
+            if parentValue['id'] == 1:
+                return univ.Integer()
+
+            return None
+
+        value = schema.clone()
+        value['blob'] = univ.Any(encoder.encode(univ.Integer(7)))
+        value['id'] = 1
+
+        s, r = decoder.decode(
+            encoder.encode(value), asn1Spec=schema, openTypeResolver=resolver
+        )
+        assert not r
+        assert isinstance(s['blob'], univ.Integer)
+        assert s['blob'] == 7
+
+    def testSequenceOfOpenTypesElementPaths(self):
+        schema = univ.Sequence(
+            componentType=namedtype.NamedTypes(
+                namedtype.NamedType('id', univ.Integer()),
+                namedtype.NamedType(
+                    'blobs', univ.SequenceOf(componentType=univ.Any()),
+                    openType=opentype.OpenType('id', {}))
+            )
+        )
+
+        paths = []
+
+        def resolver(namedType, parentValue, path):
+            paths.append(path)
+            return univ.Integer()
+
+        blobs = univ.SequenceOf(componentType=univ.Any())
+        for i in (3, 1, 4):
+            blobs.append(univ.Any(encoder.encode(univ.Integer(i))))
+
+        value = schema.clone()
+        value['id'] = 1
+        value['blobs'] = blobs
+
+        s, r = decoder.decode(
+            encoder.encode(value), asn1Spec=schema, openTypeResolver=resolver
+        )
+        assert not r
+        assert paths == [('blobs', 0), ('blobs', 1), ('blobs', 2)]
+        assert [x for x in s['blobs']] == [3, 1, 4]
+
+    def testRecursiveOpenTypesCarryContext(self):
+        inner = univ.Sequence(
+            componentType=namedtype.NamedTypes(
+                namedtype.NamedType('innerId', univ.Integer()),
+                namedtype.NamedType(
+                    'innerBlob', univ.Any(),
+                    openType=opentype.OpenType('innerId', {}))
+            )
+        )
+        outer = univ.Sequence(
+            componentType=namedtype.NamedTypes(
+                namedtype.NamedType('id', univ.Integer()),
+                namedtype.NamedType('blob', univ.Any(),
+                                    openType=opentype.OpenType('id', {}))
+            )
+        )
+
+        paths = []
+
+        def resolver(namedType, parentValue, path):
+            paths.append(path)
+
+            if path == ('blob',):
+                return inner
+
+            if path == ('blob', 'innerBlob'):
+                return univ.OctetString()
+
+            return None
+
+        innerValue = inner.clone()
+        innerValue['innerId'] = 1
+        innerValue['innerBlob'] = univ.Any(
+            encoder.encode(univ.OctetString('xy')))
+
+        outerValue = outer.clone()
+        outerValue['id'] = 1
+        outerValue['blob'] = univ.Any(encoder.encode(innerValue))
+
+        s, r = decoder.decode(
+            encoder.encode(outerValue), asn1Spec=outer,
+            openTypeResolver=resolver
+        )
+        assert not r
+        assert paths == [('blob',), ('blob', 'innerBlob')]
+        assert isinstance(s['blob']['innerBlob'], univ.OctetString)
+        assert s['blob']['innerBlob'] == univ.OctetString('xy')
+
+    def testResolverCalledOncePerValue(self):
+        calls = []
+
+        def resolver(namedType, parentValue, path):
+            calls.append(path)
+            return univ.Integer()
+
+        substrate = self._encode(self.schemaA, 1, univ.Integer(5))
+
+        s, r = decoder.decode(
+            substrate, asn1Spec=self.schemaA, openTypeResolver=resolver
+        )
+        assert not r
+        assert calls == [('blob',)]
+        assert s['blob'] == 5
+
+    def testSharedSchemaNotMutated(self):
+        shared = univ.Integer()
+
+        def resolver(namedType, parentValue, path):
+            return shared
+
+        substrate = self._encode(self.schemaA, 1, univ.Integer(5))
+
+        for _round in range(2):
+            s, r = decoder.decode(
+                substrate, asn1Spec=self.schemaA, openTypeResolver=resolver
+            )
+            assert not r
+            assert s['blob'] == 5
+
+        assert not shared.isValue
+
+    def testUnknownOpenTypeKeptRawByDefault(self):
+        def resolver(namedType, parentValue, path):
+            return None
+
+        # discriminator 3 is in neither the resolver nor the local map
+        substrate = self._encode(self.schemaA, 3, univ.Integer(5))
+
+        s, r = decoder.decode(
+            substrate, asn1Spec=self.schemaA, openTypeResolver=resolver
+        )
+        assert not r
+        assert s['blob'] == bytes((2, 1, 5))
+
+    def testUnknownOpenTypeStrictRaises(self):
+        def resolver(namedType, parentValue, path):
+            return None
+
+        # discriminator 3 is in neither the resolver nor the local map
+        substrate = self._encode(self.schemaA, 3, univ.Integer(5))
+
+        try:
+            decoder.decode(
+                substrate, asn1Spec=self.schemaA,
+                openTypeResolver=resolver, strictOpenTypes=True
+            )
+
+        except error.PyAsn1Error as exc:
+            assert 'blob' in str(exc)
+
+        else:
+            assert False, 'unresolved open type tolerated'
+
+    def testResolverErrorLocatesNestedField(self):
+        outer = univ.Sequence(
+            componentType=namedtype.NamedTypes(
+                namedtype.NamedType(
+                    'wrap', univ.Sequence(
+                        componentType=namedtype.NamedTypes(
+                            namedtype.NamedType('inner', self.schemaA),
+                        )
+                    )
+                ),
+            )
+        )
+
+        def resolver(namedType, parentValue, path):
+            raise ValueError('boom')
+
+        value = outer.clone()
+        value['wrap']['inner']['id'] = 1
+        value['wrap']['inner']['blob'] = univ.Any(
+            encoder.encode(univ.Integer(5)))
+
+        try:
+            decoder.decode(
+                encoder.encode(value), asn1Spec=outer,
+                openTypeResolver=resolver
+            )
+
+        except error.PyAsn1Error as exc:
+            assert 'wrap.inner.blob' in str(exc)
+            assert 'boom' in str(exc)
+
+        else:
+            assert False, 'resolver error tolerated'
+
+    def testIndefiniteLengthWithResolver(self):
+        # SEQUENCE indef-length { INTEGER 1, ANY(INTEGER 5) } EOO
+        substrate = bytes((48, 128, 2, 1, 1, 2, 1, 5, 0, 0))
+
+        def resolver(namedType, parentValue, path):
+            return univ.Integer()
+
+        s, r = decoder.decode(
+            substrate, asn1Spec=self.schemaA, openTypeResolver=resolver
+        )
+        assert not r
+        assert isinstance(s['blob'], univ.Integer)
+        assert s['blob'] == 5
+
+
 class SetDecoderTestCase(BaseTestCase):
     def setUp(self):
         BaseTestCase.setUp(self)
