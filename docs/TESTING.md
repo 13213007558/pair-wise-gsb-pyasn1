@@ -40,7 +40,7 @@ python -m unittest tests.type.test_univ
 There is also a hand-registered aggregate runner, `python -m tests`, discussed
 under [suite registration](#suite-registration-the-silent-failure) below. It
 and `discover` should always report the same test count; both currently report
-1261 tests. A divergence means a module is missing from a `__main__.py` list.
+1286 tests. A divergence means a module is missing from a `__main__.py` list.
 
 ### The gates, and which Python version runs each
 
@@ -139,7 +139,7 @@ is the paired Unicode-error import in `tests/type/test_univ.py`.
 Each package has a `__main__.py` whose `suite` list enumerates its children:
 
 - the `suite` list in `tests/__main__.py` → `test_debug`, `tests.type`, `tests.codec`
-- the `suite` list in `tests/codec/__main__.py` → the two cross-codec modules plus the four codec packages
+- the `suite` list in `tests/codec/__main__.py` → the three cross-codec modules plus the four codec packages
 - the `suite` list in `tests/codec/ber/__main__.py` → `test_encoder`, `test_decoder`
 
 **Adding a new test module means editing the parent `__main__.py` too.** When

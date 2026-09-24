@@ -1,6 +1,17 @@
 Revision 0.7.0, released XX-XX-2026
 ---------------------------------------
 
+- Fixed CER/DER decoder strictness not applying on the schema-driven
+  decoding path. The derived decoder `TYPE_MAP`s were inherited wholesale
+  from BER, and since that map is consulted before `TAG_MAP` whenever an
+  `asn1Spec` is supplied, calls like
+  `der.decode(b'\x01\x01\x01', asn1Spec=univ.Boolean())` silently used
+  BER's permissive payload decoders. CER and DER now override their
+  specialized type IDs (Boolean for CER, BitString/OctetString for DER) in
+  `TYPE_MAP`, so the canonical-Boolean check and the constructed-form
+  prohibition apply identically with and without a schema, through implicit
+  and explicit tags, CHOICE, constructed-type members and open types. BER
+  behavior is unchanged.
 - Fixed OverflowError from BER/CER/DER length values that fit in the
   supported 8-octet length field but exceed the platform maximum readable
   size. Such oversized definite lengths are now rejected with PyAsn1Error.

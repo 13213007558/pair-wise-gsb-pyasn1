@@ -39,6 +39,12 @@ for typeDecoder in TAG_MAP.values():
         if typeId is not None and typeId not in TYPE_MAP:
             TYPE_MAP[typeId] = typeDecoder
 
+# Schema-driven decoding consults TYPE_MAP before TAG_MAP, so the
+# stricter decoders of this codec must replace the inherited BER
+# entries there as well
+TYPE_MAP[univ.BitString.typeId] = TAG_MAP[univ.BitString.tagSet]
+TYPE_MAP[univ.OctetString.typeId] = TAG_MAP[univ.OctetString.tagSet]
+
 
 class SingleItemDecoder(decoder.SingleItemDecoder):
     __doc__ = decoder.SingleItemDecoder.__doc__

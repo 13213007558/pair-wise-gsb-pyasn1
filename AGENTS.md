@@ -74,17 +74,23 @@ downstream callers depend on. Rationale in
   codec copies the parent's `TAG_MAP`/`TYPE_MAP` *shallowly* at import: 22 of
   26 payload-decoder and 22 of 27 payload-encoder `TAG_MAP` instances are the
   same objects in all three codecs, and the derived *decoder* `TYPE_MAP`s are
-  inherited wholesale. Editing a BER payload codec, or setting an attribute on
+  inherited wholesale except for the explicit strict-decoder overrides
+  (Boolean in `cer/decoder.py`, BitString/OctetString in `der/decoder.py`).
+  Editing a BER payload codec, or setting an attribute on
   one of those instances, changes DER, which signature verification depends
   on. Conversely, registering a new type in the BER source is enough; only
   *runtime* mutation after import fails to propagate. Add to `cer/` or `der/`
   only when that codec needs different behavior.
-- **CER/DER decoder strictness does not fire on the schema-driven path**,
-  because the fully inherited `TYPE_MAP` is consulted before `TAG_MAP`
-  whenever an `asn1Spec` is supplied. DER's `supportConstructedForm=False` and
-  CER's canonical Boolean check are inert there; only
-  `supportIndefLength=False` is unconditional. Test strictness changes both
-  with and without a schema.
+- **CER/DER decoder strictness fires on both dispatch paths.** The
+  schema-driven path consults `TYPE_MAP` before `TAG_MAP` whenever an
+  `asn1Spec` is supplied, so the derived codecs override their specialized
+  type IDs there: `TYPE_MAP[univ.Boolean.typeId]` in `cer/decoder.py` and
+  `TYPE_MAP[univ.BitString.typeId]`/`TYPE_MAP[univ.OctetString.typeId]` in
+  `der/decoder.py` point at the codecs' own strict decoders, not the
+  inherited BER ones. DER's `supportConstructedForm=False`, CER's canonical
+  Boolean check and DER's `supportIndefLength=False` therefore all apply
+  with or without a schema. Test strictness changes both ways; the shared
+  cases live in `tests/codec/test_decoder_strictness.py`.
 - **Do not weaken the decoder limits.** `MAX_OID_ARC_CONTINUATION_OCTETS`,
   `MAX_TAG_OCTETS`, `MAX_NESTING_DEPTH` and `MAX_LENGTH_OCTETS` sit at the top
   of `pyasn1/codec/ber/decoder.py`; the unnamed `length > sys.maxsize` guard

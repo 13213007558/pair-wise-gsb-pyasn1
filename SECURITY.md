@@ -32,7 +32,6 @@ process.
 - Resource use proportional (roughly linear) to input size
 - Anything that requires a hostile ASN.1 *schema*: schemas are trusted code
   supplied by the application, not attacker input
-- The documented CER/DER strictness gaps on the schema-driven decoding path
 - Timing variation: pyasn1 makes no constant-time guarantees
 
 The inventory of current decoder limits and past CVEs is kept in
