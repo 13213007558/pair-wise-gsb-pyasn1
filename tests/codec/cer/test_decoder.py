@@ -6,9 +6,11 @@
 #
 import sys
 import unittest
+import io
 
 from tests.base import BaseTestCase
 
+from pyasn1 import error
 from pyasn1.type import tag
 from pyasn1.type import namedtype
 from pyasn1.type import opentype
@@ -36,6 +38,126 @@ class BooleanDecoderTestCase(BaseTestCase):
             decoder.decode(bytes((1, 2, 0, 0)))
         except PyAsn1Error:
             pass
+
+
+class BooleanStrictnessDecoderTestCase(BaseTestCase):
+    """CER requires the canonical Boolean payload (X.690 11.1) both with
+    and without an ASN.1 schema guiding the decoder."""
+
+    def testCanonicalForms(self):
+        for asn1Spec in None, univ.Boolean():
+            assert decoder.decode(
+                bytes((1, 1, 255)), asn1Spec=asn1Spec) == (1, b'')
+            assert decoder.decode(
+                bytes((1, 1, 0)), asn1Spec=asn1Spec) == (0, b'')
+
+    def testNonCanonicalTrue(self):
+        for asn1Spec in None, univ.Boolean():
+            try:
+                decoder.decode(bytes((1, 1, 1)), asn1Spec=asn1Spec)
+            except PyAsn1Error:
+                pass
+            else:
+                assert 0, 'non-canonical Boolean tolerated'
+
+    def testNonCanonicalTrueImplicitTag(self):
+        asn1Spec = univ.Boolean().subtype(implicitTag=tag.Tag(
+            tag.tagClassContext, tag.tagFormatSimple, 0))
+
+        assert decoder.decode(bytes((128, 1, 255)), asn1Spec=asn1Spec) == (1, b'')
+
+        try:
+            decoder.decode(bytes((128, 1, 1)), asn1Spec=asn1Spec)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'non-canonical Boolean tolerated'
+
+    def testNonCanonicalTrueExplicitTag(self):
+        asn1Spec = univ.Boolean().subtype(explicitTag=tag.Tag(
+            tag.tagClassContext, tag.tagFormatConstructed, 0))
+
+        assert decoder.decode(
+            bytes((160, 3, 1, 1, 255)), asn1Spec=asn1Spec) == (1, b'')
+
+        try:
+            decoder.decode(bytes((160, 3, 1, 1, 1)), asn1Spec=asn1Spec)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'non-canonical Boolean tolerated'
+
+    def testNonCanonicalTrueChoice(self):
+        asn1Spec = univ.Choice(componentType=namedtype.NamedTypes(
+            namedtype.NamedType('flag', univ.Boolean())))
+
+        value, _ = decoder.decode(bytes((1, 1, 255)), asn1Spec=asn1Spec)
+        assert value['flag'] == 1
+
+        try:
+            decoder.decode(bytes((1, 1, 1)), asn1Spec=asn1Spec)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'non-canonical Boolean tolerated'
+
+    def testNonCanonicalTrueSequenceMember(self):
+        asn1Spec = univ.Sequence(componentType=namedtype.NamedTypes(
+            namedtype.NamedType('flag', univ.Boolean())))
+
+        value, _ = decoder.decode(bytes((48, 3, 1, 1, 255)), asn1Spec=asn1Spec)
+        assert value['flag'] == 1
+
+        try:
+            decoder.decode(bytes((48, 3, 1, 1, 1)), asn1Spec=asn1Spec)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'non-canonical Boolean tolerated'
+
+    def testNonCanonicalTrueOpenType(self):
+        openType = opentype.OpenType('id', {1: univ.Boolean()})
+        asn1Spec = univ.Sequence(componentType=namedtype.NamedTypes(
+            namedtype.NamedType('id', univ.Integer()),
+            namedtype.NamedType('blob', univ.Any(), openType=openType)))
+
+        value, _ = decoder.decode(
+            bytes((48, 6, 2, 1, 1, 1, 1, 255)),
+            asn1Spec=asn1Spec, decodeOpenTypes=True)
+        assert value['blob'] == 1
+
+        try:
+            decoder.decode(
+                bytes((48, 6, 2, 1, 1, 1, 1, 1)),
+                asn1Spec=asn1Spec, decodeOpenTypes=True)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'non-canonical Boolean tolerated'
+
+    def testNonCanonicalTrueChunked(self):
+        class NonBlockingStream(io.BytesIO):
+            block = False
+
+            def read(self, size=-1):
+                self.block = not self.block
+                if self.block:
+                    return  # this is what non-blocking streams sometimes do
+
+                return io.BytesIO.read(self, size)
+
+        iterator = iter(decoder.StreamingDecoder(
+            NonBlockingStream(bytes((1, 1, 1))), asn1Spec=univ.Boolean()))
+
+        try:
+            while True:
+                chunk = next(iterator)
+                assert isinstance(chunk, error.SubstrateUnderrunError), (
+                    'unverified object yielded as a value: %r' % (chunk,))
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'non-canonical Boolean tolerated'
 
 
 class BitStringDecoderTestCase(BaseTestCase):

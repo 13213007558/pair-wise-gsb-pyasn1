@@ -1,6 +1,12 @@
 Revision 0.7.0, released XX-XX-2026
 ---------------------------------------
 
+- Fixed CER/DER decoder strictness being bypassed whenever an ``asn1Spec``
+  schema was supplied: the schema-driven dispatch consulted the inherited
+  BER ``TYPE_MAP``, so CER accepted non-canonical Boolean payloads and DER
+  accepted constructed-form string encodings. The strict decoders now
+  override the inherited ``TYPE_MAP`` entries, making both decoding paths
+  enforce the same rules.
 - Fixed OverflowError from BER/CER/DER length values that fit in the
   supported 8-octet length field but exceed the platform maximum readable
   size. Such oversized definite lengths are now rejected with PyAsn1Error.

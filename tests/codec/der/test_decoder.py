@@ -6,9 +6,11 @@
 #
 import sys
 import unittest
+import io
 
 from tests.base import BaseTestCase
 
+from pyasn1 import error
 from pyasn1.type import tag
 from pyasn1.type import namedtype
 from pyasn1.type import opentype
@@ -70,6 +72,179 @@ class OctetStringDecoderTestCase(BaseTestCase):
             pass
         else:
             assert 0, 'chunked encoding tolerated'
+
+
+class BooleanStrictnessDecoderTestCase(BaseTestCase):
+    """DER requires the canonical Boolean payload (X.690 11.1) both with
+    and without an ASN.1 schema guiding the decoder."""
+
+    def testCanonicalForms(self):
+        for asn1Spec in None, univ.Boolean():
+            assert decoder.decode(
+                bytes((1, 1, 255)), asn1Spec=asn1Spec) == (1, b'')
+            assert decoder.decode(
+                bytes((1, 1, 0)), asn1Spec=asn1Spec) == (0, b'')
+
+    def testNonCanonicalTrue(self):
+        for asn1Spec in None, univ.Boolean():
+            try:
+                decoder.decode(bytes((1, 1, 1)), asn1Spec=asn1Spec)
+            except PyAsn1Error:
+                pass
+            else:
+                assert 0, 'non-canonical Boolean tolerated'
+
+
+class ConstructedEncodingDecoderTestCase(BaseTestCase):
+    """DER prohibits the constructed encoding form of string types
+    (X.690 10.2) both with and without an ASN.1 schema guiding
+    the decoder."""
+
+    def setUp(self):
+        BaseTestCase.setUp(self)
+
+        self.primitiveOctetString = bytes((4, 1, 65))
+        self.constructedOctetString = bytes((36, 3, 4, 1, 65))
+
+    def testPrimitiveOctetString(self):
+        for asn1Spec in None, univ.OctetString():
+            assert decoder.decode(
+                self.primitiveOctetString, asn1Spec=asn1Spec) == (b'A', b'')
+
+    def testConstructedOctetString(self):
+        for asn1Spec in None, univ.OctetString():
+            try:
+                decoder.decode(self.constructedOctetString, asn1Spec=asn1Spec)
+            except PyAsn1Error:
+                pass
+            else:
+                assert 0, 'constructed OCTET STRING tolerated'
+
+    def testConstructedBitString(self):
+        for asn1Spec in None, univ.BitString():
+            assert decoder.decode(
+                bytes((3, 2, 0, 170)), asn1Spec=asn1Spec
+            ) == ((1, 0, 1, 0, 1, 0, 1, 0), b'')
+
+            try:
+                decoder.decode(bytes((35, 4, 3, 2, 0, 170)), asn1Spec=asn1Spec)
+            except PyAsn1Error:
+                pass
+            else:
+                assert 0, 'constructed BIT STRING tolerated'
+
+    def testConstructedOctetStringImplicitTag(self):
+        asn1Spec = univ.OctetString().subtype(implicitTag=tag.Tag(
+            tag.tagClassContext, tag.tagFormatConstructed, 0))
+
+        try:
+            decoder.decode(bytes((160, 3, 4, 1, 65)), asn1Spec=asn1Spec)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed OCTET STRING tolerated'
+
+    def testConstructedOctetStringExplicitTag(self):
+        asn1Spec = univ.OctetString().subtype(explicitTag=tag.Tag(
+            tag.tagClassContext, tag.tagFormatConstructed, 0))
+
+        try:
+            decoder.decode(bytes((160, 5, 36, 3, 4, 1, 65)), asn1Spec=asn1Spec)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed OCTET STRING tolerated'
+
+    def testConstructedOctetStringChoice(self):
+        asn1Spec = univ.Choice(componentType=namedtype.NamedTypes(
+            namedtype.NamedType('blob', univ.OctetString())))
+
+        value, _ = decoder.decode(self.primitiveOctetString, asn1Spec=asn1Spec)
+        assert value['blob'] == b'A'
+
+        try:
+            decoder.decode(self.constructedOctetString, asn1Spec=asn1Spec)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed OCTET STRING tolerated'
+
+    def testConstructedOctetStringSequenceMember(self):
+        asn1Spec = univ.Sequence(componentType=namedtype.NamedTypes(
+            namedtype.NamedType('blob', univ.OctetString())))
+
+        value, _ = decoder.decode(
+            bytes((48, 3, 4, 1, 65)), asn1Spec=asn1Spec)
+        assert value['blob'] == b'A'
+
+        try:
+            decoder.decode(
+                bytes((48, 5, 36, 3, 4, 1, 65)), asn1Spec=asn1Spec)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed OCTET STRING tolerated'
+
+    def testConstructedOctetStringSetMember(self):
+        asn1Spec = univ.Set(componentType=namedtype.NamedTypes(
+            namedtype.NamedType('blob', univ.OctetString())))
+
+        value, _ = decoder.decode(
+            bytes((49, 3, 4, 1, 65)), asn1Spec=asn1Spec)
+        assert value['blob'] == b'A'
+
+        try:
+            decoder.decode(
+                bytes((49, 5, 36, 3, 4, 1, 65)), asn1Spec=asn1Spec)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed OCTET STRING tolerated'
+
+    def testConstructedOctetStringOpenType(self):
+        openType = opentype.OpenType('id', {1: univ.OctetString()})
+        asn1Spec = univ.Sequence(componentType=namedtype.NamedTypes(
+            namedtype.NamedType('id', univ.Integer()),
+            namedtype.NamedType('blob', univ.Any(), openType=openType)))
+
+        value, _ = decoder.decode(
+            bytes((48, 6, 2, 1, 1, 4, 1, 65)),
+            asn1Spec=asn1Spec, decodeOpenTypes=True)
+        assert value['blob'] == b'A'
+
+        try:
+            decoder.decode(
+                bytes((48, 8, 2, 1, 1, 36, 3, 4, 1, 65)),
+                asn1Spec=asn1Spec, decodeOpenTypes=True)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed OCTET STRING tolerated'
+
+    def testConstructedOctetStringChunked(self):
+        class NonBlockingStream(io.BytesIO):
+            block = False
+
+            def read(self, size=-1):
+                self.block = not self.block
+                if self.block:
+                    return  # this is what non-blocking streams sometimes do
+
+                return io.BytesIO.read(self, size)
+
+        iterator = iter(decoder.StreamingDecoder(
+            NonBlockingStream(self.constructedOctetString),
+            asn1Spec=univ.OctetString()))
+
+        try:
+            while True:
+                chunk = next(iterator)
+                assert isinstance(chunk, error.SubstrateUnderrunError), (
+                    'unverified object yielded as a value: %r' % (chunk,))
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed OCTET STRING tolerated'
 
 
 class LargeTagDecoderTestCase(BaseTestCase):

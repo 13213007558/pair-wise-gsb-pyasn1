@@ -70,6 +70,11 @@ for typeDecoder in TAG_MAP.values():
         if typeId is not None and typeId not in TYPE_MAP:
             TYPE_MAP[typeId] = typeDecoder
 
+# Schema-driven decoding dispatches through TYPE_MAP, which still holds
+# the lenient BER decoder inherited with the copy: override it with the
+# strict CER one
+TYPE_MAP[univ.Boolean.typeId] = TAG_MAP[univ.Boolean.tagSet]
+
 
 class SingleItemDecoder(decoder.SingleItemDecoder):
     __doc__ = decoder.SingleItemDecoder.__doc__

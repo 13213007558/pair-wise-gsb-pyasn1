@@ -79,11 +79,14 @@ downstream callers depend on. Rationale in
   on. Conversely, registering a new type in the BER source is enough; only
   *runtime* mutation after import fails to propagate. Add to `cer/` or `der/`
   only when that codec needs different behavior.
-- **CER/DER decoder strictness does not fire on the schema-driven path**,
-  because the fully inherited `TYPE_MAP` is consulted before `TAG_MAP`
-  whenever an `asn1Spec` is supplied. DER's `supportConstructedForm=False` and
-  CER's canonical Boolean check are inert there; only
-  `supportIndefLength=False` is unconditional. Test strictness changes both
+- **CER/DER decoder strictness lives in two maps.** Schemaless decoding
+  dispatches through `TAG_MAP`; with an `asn1Spec`, `TYPE_MAP` is consulted
+  first. The strict decoders (CER's canonical Boolean check, DER's
+  `supportConstructedForm=False`) are mirrored into the derived `TYPE_MAP`s
+  by explicit assignments in `cer/decoder.py` and `der/decoder.py`: a new
+  strict payload decoder must be registered in both maps or it stays inert
+  on the schema path. DER's `supportIndefLength=False` sits on
+  `SingleItemDecoder` and is unconditional. Test strictness changes both
   with and without a schema.
 - **Do not weaken the decoder limits.** `MAX_OID_ARC_CONTINUATION_OCTETS`,
   `MAX_TAG_OCTETS`, `MAX_NESTING_DEPTH` and `MAX_LENGTH_OCTETS` sit at the top

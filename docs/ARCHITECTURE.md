@@ -753,7 +753,7 @@ flowchart LR
         CEM["encoder TAG_MAP + TYPE_MAP<br/>copy of BER plus update"]
         CEO["REAL OVERRIDES<br/>BooleanEncoder emits 255<br/>RealEncoder forces value base<br/>GeneralizedTime + UTCTime<br/>SetOfEncoder padded chunk sort<br/>SetEncoder STATIC choice key<br/>SequenceEncoder omitEmptyOptionals<br/>SequenceOfEncoder ifNotEmpty"]
         CSE["SingleItemEncoder<br/>fixedDefLengthMode False<br/>fixedChunkSize 1000"]
-        CDM["decoder TAG_MAP + TYPE_MAP<br/>copy plus backfill that adds nothing"]
+        CDM["decoder TAG_MAP + TYPE_MAP<br/>copy plus Boolean TYPE_MAP override"]
         CDO["REAL OVERRIDE<br/>BooleanPayloadDecoder<br/>accepts only 0x00 and 0xFF"]
         CDA["aliases only - no behavior change<br/>BitString OctetString Real"]
         CSD["SingleItemDecoder<br/>no override - inherits BER"]
@@ -769,7 +769,7 @@ flowchart LR
         DEM["encoder TAG_MAP + TYPE_MAP<br/>copy of CER plus update"]
         DEO["REAL OVERRIDE - one class only<br/>SetEncoder DYNAMIC choice key<br/>resolves the chosen alternative"]
         DSE["SingleItemEncoder<br/>fixedDefLengthMode True<br/>fixedChunkSize 0"]
-        DDM["decoder TAG_MAP + TYPE_MAP<br/>copy plus backfill that adds nothing"]
+        DDM["decoder TAG_MAP + TYPE_MAP<br/>copy plus BitString OctetString<br/>TYPE_MAP overrides"]
         DDO["REAL OVERRIDES<br/>BitString supportConstructedForm False<br/>OctetString supportConstructedForm False"]
         DSD["SingleItemDecoder<br/>supportIndefLength False"]
         DEO -->|"update"| DEM
@@ -780,8 +780,8 @@ flowchart LR
 
     BEM -.->|"shallow copy - 22 of 28 tag entries<br/>and 21 of 29 type entries are the SAME objects"| CEM
     CEM -.->|"shallow copy - 27 of 28 tag entries<br/>and 28 of 29 type entries are the SAME objects"| DEM
-    BDM -.->|"shallow copy - 22 of 26 tag entries<br/>and ALL 28 type entries are the SAME objects"| CDM
-    CDM -.->|"shallow copy - 23 of 26 tag entries<br/>and ALL 28 type entries are the SAME objects"| DDM
+    BDM -.->|"shallow copy - 22 of 26 tag entries<br/>and 27 of 28 type entries are the SAME objects"| CDM
+    CDM -.->|"shallow copy - 23 of 26 tag entries<br/>and 26 of 28 type entries are the SAME objects"| DDM
 
     classDef override fill:#fff2cc,stroke:#b8860b,stroke-width:3px,color:#000
     classDef maps fill:#dae8fc,stroke:#3c6ea5,stroke-width:2px,color:#000
@@ -796,11 +796,11 @@ flowchart LR
 The dotted copy edges carry the measured counts. The CER encoder keeps 22 of
 28 tag entries and 21 of 29 type entries as the same objects as BER's; the DER
 encoder keeps 27 of 28 and 28 of 29 relative to CER; on the decoder side the
-copies keep 22 of 26 and then 23 of 26 tag entries, with all 28 type entries
-identical at both steps. The derived decoder `TYPE_MAP`s are therefore
-100 percent inherited, so CER and DER strictness applies only on the schemaless
-tag-driven path; [Registration and import
-order](#registration-and-import-order) traces the mechanism.
+copies keep 22 of 26 and then 23 of 26 tag entries, and 27 of 28 then 26 of
+28 type entries. The decoder `TYPE_MAP` overrides are what make CER and DER
+strictness apply on the schema-driven path as well as the schemaless one;
+[Registration and import order](#registration-and-import-order) traces the
+mechanism.
 
 ### Sharing by identity
 
@@ -829,7 +829,7 @@ Measured by identity comparison:
 | `der.encoder.TAG_MAP` | 28 | 22 | 6 |
 | `der.encoder.TYPE_MAP` | 29 | 21 | 8 |
 | `der.decoder.TAG_MAP` | 26 | 22 | 4 |
-| `der.decoder.TYPE_MAP` | 28 | 28 | 0 |
+| `der.decoder.TYPE_MAP` | 28 | 25 | 3 |
 
 The distinct entries are few. On the encoder side they are Boolean, Real, the
 two time types, Set/SetOf, Sequence/SequenceOf (`TYPE_MAP` only: CER's
@@ -840,9 +840,13 @@ Boolean (from CER), BitString and OctetString (the two
 re-instantiated but behaviorally identical `RealPayloadDecoder`: the
 `RealPayloadDecoder = decoder.RealPayloadDecoder` alias in `der/decoder.py`,
 whose `# TODO: prohibit non-canonical encoding` comment marks it as a
-placeholder for a stricter decoder nobody wrote. Between CER and DER the
-coupling is tighter still: DER's entire encoder-side contribution is one class
-plus two class attributes.
+placeholder for a stricter decoder nobody wrote. The same three behavioral
+decoder overrides are mirrored into the derived `TYPE_MAP`s by the explicit
+`TYPE_MAP[univ.X.typeId] = TAG_MAP[univ.X.tagSet]` assignments following the
+backfill loops in `cer/decoder.py` (Boolean) and `der/decoder.py` (BitString,
+OctetString), so schema-driven dispatch reaches them too. Between CER and DER
+the coupling is tighter still: DER's entire encoder-side contribution is one
+class plus two class attributes.
 
 Editing a BER payload codec thus edits DER, and there is no indirection
 to absorb the change. An edit to `IntegerEncoder.encodeValue` in
@@ -899,34 +903,40 @@ constructed types are ambiguous or untagged by tagSet alone ([The type
 system](#the-type-system)), and both maps read each type's `typeId` at import
 ([Type identity and dispatch keys](#type-identity-and-dispatch-keys)). By the
 time CER's loop runs, its `TYPE_MAP` is already a copy of BER's post-backfill
-map, so the derived loops add nothing, and `cer.decoder.TYPE_MAP` and
-`der.decoder.TYPE_MAP` share all 28 entries with BER's. The encoder side has
+map, so the derived loops add nothing. The strict decoders reach the derived
+`TYPE_MAP`s through explicit assignments instead:
+`TYPE_MAP[univ.Boolean.typeId] = TAG_MAP[univ.Boolean.tagSet]` in
+`cer/decoder.py`, and the BitString/OctetString pair in `der/decoder.py`,
+leaving 27 of 28 (`cer.decoder.TYPE_MAP`) and 25 of 28
+(`der.decoder.TYPE_MAP`) entries shared with BER's. The encoder side has
 no backfill at all: encoder `TYPE_MAP`s are written out longhand (the
 module-level `TYPE_MAP = {...}` literal in `ber/encoder.py`) or copied and
 updated by hand.
 
-The two maps serve different code paths, and the schema-driven path bypasses
-derived-codec strictness. Both paths live in `SingleItemDecoder.__call__` in
+The two maps serve different code paths, and the derived-codec strictness
+must hold on both. Both paths live in `SingleItemDecoder.__call__` in
 `ber/decoder.py`: schemaless decoding dispatches through `tagMap` in the
 `stGetValueDecoderByTag` state, while decoding with an `asn1Spec` (the way
 X.509 and LDAP consumers actually call pyasn1) takes the
 `stGetValueDecoderByAsn1Spec` state, which consults
-`typeMap[chosenSpec.typeId]` first, and the `TYPE_MAP` hit returns BER's
-permissive decoder. Two probes confirm it:
+`typeMap[chosenSpec.typeId]` first. The explicit `TYPE_MAP` overrides in
+`cer/decoder.py` and `der/decoder.py` route that lookup to the strict
+decoders; without them the `TYPE_MAP` hit would return BER's permissive
+decoder. Two probes pin the parity:
 
 - `der.decode(b'\x24\x06\x04\x01a\x04\x01b')` raises
-  `Constructed encoding form prohibited`, but the same bytes with
-  `asn1Spec=univ.OctetString()` decode fine.
-- `cer.decode(b'\x01\x01\x01')` raises `Unexpected Boolean payload: 1`, but
-  with `asn1Spec=univ.Boolean()` returns `True`.
+  `Constructed encoding form prohibited`, and so does the same substrate
+  with `asn1Spec=univ.OctetString()`.
+- `cer.decode(b'\x01\x01\x01')` raises `Unexpected Boolean payload: 1`,
+  and so does the same substrate with `asn1Spec=univ.Boolean()`.
 
-The one DER restriction that always applies is `supportIndefLength = False`,
-because it sits on `der/decoder.py`'s `SingleItemDecoder` itself rather than
-in a map. Removing the `typeId not in TYPE_MAP` guard from the derived
-backfill loops looks like a cleanup but would newly route schema-driven
-CER/DER decodes through the strict subclasses, breaking every caller that
-currently (if accidentally) relies on DER accepting constructed OCTET STRINGs
-under a schema.
+The overrides are explicit assignments rather than a dropped
+`typeId not in TYPE_MAP` guard in the derived backfill loops, because the
+guard is what keeps BER's own backfill safe from a duplicate `typeId`
+claiming a slot ([Type identity and dispatch
+keys](#type-identity-and-dispatch-keys)). The one DER restriction that needs
+no map entry at all is `supportIndefLength = False`, because it sits on
+`der/decoder.py`'s `SingleItemDecoder` itself rather than in a map.
 
 Registration history has also left dead weight in the maps. The module-level
 `TAG_MAP.update({...})` block in `cer/encoder.py` registers
@@ -1866,13 +1876,6 @@ them as a drive-by; each needs its own dedicated change with tests.
   round-trips depend on that; the codec constructors end in `**ignored`, so
   `decode(b'\x02\x01\x01', typoOption=True)` succeeds. The encoder-side
   probe is in [Configuration surfaces](#configuration-surfaces).
-- **Derived-codec strictness is bypassed under a schema.** The derived
-  decoder `TYPE_MAP`s are fully inherited and consulted before `TAG_MAP`
-  when an `asn1Spec` is supplied, so DER's `supportConstructedForm=False`
-  and CER's canonical-Boolean check are inert on the schema path; only DER's
-  `supportIndefLength=False` always applies. Details in
-  [The codec family](#the-codec-family) and
-  [Registration and import order](#registration-and-import-order).
 - **`native.decoder.decode` returns a bare object**, not
   `(value, remainder)`, and the Sphinx doc-comment on its `decode` attribute
   shows the tuple-unpacking form, which would raise. Details in
@@ -1882,4 +1885,3 @@ them as a drive-by; each needs its own dedicated change with tests.
   literal text. Not worth a churn-heavy rewrite mid-release; if ever fixed,
   do it as a dedicated pass verified with `tox -e docs`, since the file is
   compiled into the `-W` build.
-
