@@ -21,6 +21,14 @@ Revision 0.7.0, released XX-XX-2026
   qualifies for a private advisory and a CVE versus what is handled
   as an ordinary public bug report
   [issue #96](https://github.com/pyasn1/pyasn1/issues/96)
+- Added ``StreamingEncoder`` to the BER codec: an incremental encoder that
+  yields the serialization chunk by chunk, emitting indefinite-length
+  constructed types terminated by end-of-octets markers. It accepts
+  one-shot iterables as SequenceOf/SetOf component sources, chunks long
+  OCTET STRING values, spools sized sources (bounded by ``maxSpoolSize``)
+  or rejects non-sized ones when definite-length output is requested,
+  and re-raises component encoding failures with the component position
+  instead of emitting a trailing end-of-octets marker
 
 Revision 0.6.4, released 08-07-2026
 ---------------------------------------

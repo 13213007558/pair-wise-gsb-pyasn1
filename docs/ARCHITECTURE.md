@@ -84,7 +84,7 @@ The package is thirty-two modules; four carry most of the weight:
 | `type/error.py` | A *second* `ValueConstraintError`, the one actually raised |
 | `codec/streaming.py` | `asSeekableStream`, `CachingStreamWrapper`, `readFromStream`: the resumable-stream engine |
 | `codec/ber/decoder.py` | The base decoder: payload decoders, the state machine, every security limit |
-| `codec/ber/encoder.py` | The base encoder |
+| `codec/ber/encoder.py` | The base encoder, plus the incremental `StreamingEncoder` |
 | `codec/ber/eoo.py` | The end-of-octets singleton |
 | `codec/cer/*`, `codec/der/*` | Derived codecs, sharing BER's objects by identity |
 | `codec/native/*` | Conversion to and from Python dicts, lists and scalars |
@@ -1147,6 +1147,38 @@ governs how the encoders read the value; how they read the schema is a
 separate contract with its own reason not to change, described in [Recursive
 schemas](#recursive-schemas).
 
+
+### Incremental encoding
+
+`Encoder`/`encode` always builds the full serialization in memory
+before returning it, which is the wrong shape for writing a very large
+`SequenceOf` to a socket. `StreamingEncoder` in `ber/encoder.py` is the
+incremental entry point: its `__call__` returns a generator that yields the
+BER serialization chunk by chunk, encoding each component only when the
+consumer pulls the chunk that contains it. Constructed types are emitted
+in the indefinite-length form (the default `defMode=False`), closed by the
+end-of-octets marker, so no length is ever needed up-front; explicit tags
+become nested indefinite-length containers, and a long OCTET STRING is
+chunked with `maxChunkSize` exactly as `OctetStringEncoder` does it.
+`Sequence`, `Set`, `Choice` and the primitive types are delegated to
+`SingleItemEncoder` and materialize as a single chunk; only
+`SequenceOf`/`SetOf` and chunked OCTET STRING stream incrementally.
+
+The components of a `SequenceOf`/`SetOf` may come from a one-shot
+iterator (with `asn1Spec` supplying the `componentType`): the source is
+consumed at most once and only as far as the consumer pulls. Requesting
+`defMode=True` contradicts that laziness, because a definite length must
+be known before the header is written; the encoder therefore spools the
+components of a sized container into a buffer bounded by `maxSpoolSize`
+(default `StreamingEncoder.maxSpoolSize`, 1 MiB) and rejects a non-sized
+source outright rather than silently consuming it twice. If a component
+fails to encode mid-stream — a constraint violation surfacing from
+`clone()` is the common case — the original exception type is re-raised
+with the component position in the message and no end-of-octets marker is
+emitted past that point, so a truncated stream can never be mistaken for
+a complete one. Concatenated, the chunks decode through `StreamingDecoder`
+to the same object the one-shot `encode` produces.
+
 ### The native codec
 
 `codec/native/` converts between pyasn1 objects and Python built-ins. It
@@ -1882,4 +1914,3 @@ them as a drive-by; each needs its own dedicated change with tests.
   literal text. Not worth a churn-heavy rewrite mid-release; if ever fixed,
   do it as a dedicated pass verified with `tox -e docs`, since the file is
   compiled into the `-W` build.
-
