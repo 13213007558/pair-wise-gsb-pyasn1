@@ -1,6 +1,18 @@
 Revision 0.7.0, released XX-XX-2026
 ---------------------------------------
 
+- Added optional raw encoding view to the BER decoder (inherited by CER
+  and DER): passing ``rawView=decoder.RawView()`` to ``decode()`` or
+  ``StreamingDecoder`` records the tag, length, value and complete TLV
+  octet ranges of every decoded item exactly as received, queryable by
+  field path without touching ASN.1 value equality. Definite and
+  indefinite lengths are supported (the latter's full range includes
+  its own EOC), explicit-tag wrappers and inner values are reported as
+  separate layers, ANY values re-decoded as open types keep both layers
+  of provenance, and consecutive top-level objects share one offset
+  space. Bytes substrates are sliced zero-copy; stream substrates are
+  reported through a caller-side sink callback that owns the saved
+  octets
 - Fixed OverflowError from BER/CER/DER length values that fit in the
   supported 8-octet length field but exceed the platform maximum readable
   size. Such oversized definite lengths are now rejected with PyAsn1Error.

@@ -12,6 +12,7 @@ import warnings
 from pyasn1 import debug
 from pyasn1 import error
 from pyasn1.codec.ber import eoo
+from pyasn1.codec.ber.rawview import RawView
 from pyasn1.codec.streaming import asSeekableStream
 from pyasn1.codec.streaming import isEndOfStream
 from pyasn1.codec.streaming import peekIntoStream
@@ -25,7 +26,7 @@ from pyasn1.type import tagmap
 from pyasn1.type import univ
 from pyasn1.type import useful
 
-__all__ = ['StreamingDecoder', 'Decoder', 'decode']
+__all__ = ['StreamingDecoder', 'Decoder', 'decode', 'RawView']
 
 LOG = debug.registerLoggee(__name__, flags=debug.DEBUG_DECODER)
 
@@ -826,6 +827,8 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                     openTypes = options.get('openTypes', {})
 
+                    rawView = options.get('rawView')
+
                     if LOG:
                         LOG('user-specified open types map:')
 
@@ -884,6 +887,10 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                                     stream = asSeekableStream(containerValue[pos].asOctets())
 
+                                    if rawView is not None:
+                                        stream = rawView._derive(
+                                            stream, containerValue[pos])
+
                                     for component in decodeFun(stream, asn1Spec=openType, **options):
                                         if isinstance(component, SubstrateUnderrunError):
                                             yield component
@@ -892,6 +899,10 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                             else:
                                 stream = asSeekableStream(asn1Object.getComponentByPosition(idx).asOctets())
+
+                                if rawView is not None:
+                                    stream = rawView._derive(
+                                        stream, asn1Object.getComponentByPosition(idx))
 
                                 for component in decodeFun(stream, asn1Spec=openType, **options):
                                     if isinstance(component, SubstrateUnderrunError):
@@ -1045,6 +1056,8 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                     openTypes = options.get('openTypes', {})
 
+                    rawView = options.get('rawView')
+
                     if LOG:
                         LOG('user-specified open types map:')
 
@@ -1103,6 +1116,10 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                                     stream = asSeekableStream(containerValue[pos].asOctets())
 
+                                    if rawView is not None:
+                                        stream = rawView._derive(
+                                            stream, containerValue[pos])
+
                                     for component in decodeFun(stream, asn1Spec=openType,
                                                                **dict(options, allowEoo=True)):
                                         if isinstance(component, SubstrateUnderrunError):
@@ -1115,6 +1132,11 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                             else:
                                 stream = asSeekableStream(asn1Object.getComponentByPosition(idx).asOctets())
+
+                                if rawView is not None:
+                                    stream = rawView._derive(
+                                        stream, asn1Object.getComponentByPosition(idx))
+
                                 for component in decodeFun(stream, asn1Spec=openType,
                                                            **dict(options, allowEoo=True)):
                                     if isinstance(component, SubstrateUnderrunError):
@@ -1616,6 +1638,12 @@ class SingleItemDecoder(object):
 
         substrate.markedPosition = substrate.tell()
 
+        rawView = options.get('rawView')
+
+        if rawView is not None:
+            rawView._open()
+            tagStart = tagEnd = valueStart = substrate.tell()
+
         while state is not stStop:
 
             if state is stDecodeTag:
@@ -1695,6 +1723,9 @@ class SingleItemDecoder(object):
 
             if state is stDecodeLength:
                 # Decode length
+                if rawView is not None:
+                    tagEnd = substrate.tell()
+
                 for firstOctet in readFromStream(substrate, 1, options):
                     if isinstance(firstOctet, SubstrateUnderrunError):
                         yield firstOctet
@@ -1747,6 +1778,9 @@ class SingleItemDecoder(object):
                     LOG('value length decoded into %d' % length)
 
             if state is stGetValueDecoder:
+                if rawView is not None:
+                    valueStart = substrate.tell()
+
                 if asn1Spec is None:
                     state = stGetValueDecoderByTag
 
@@ -1937,6 +1971,10 @@ class SingleItemDecoder(object):
             debug.scope.pop()
             LOG('decoder left scope %s, call completed' % debug.scope)
 
+        if rawView is not None:
+            rawView._close(substrate, tagStart, tagEnd, valueStart,
+                           substrate.tell(), value)
+
         yield value
 
 
@@ -2019,7 +2057,15 @@ class StreamingDecoder(object):
 
     def __init__(self, substrate, asn1Spec=None, **options):
         self._singleItemDecoder = self.SINGLE_ITEM_DECODER(**options)
-        self._substrate = asSeekableStream(substrate)
+
+        stream = asSeekableStream(substrate)
+
+        rawView = options.get('rawView')
+
+        if rawView is not None:
+            stream = rawView._track(stream, substrate)
+
+        self._substrate = stream
         self._asn1Spec = asn1Spec
         self._options = options
 
@@ -2126,7 +2172,14 @@ class Decoder(object):
             1 2 3
 
         """
-        substrate = asSeekableStream(substrate)
+        stream = asSeekableStream(substrate)
+
+        rawView = options.get('rawView')
+
+        if rawView is not None:
+            stream = rawView._track(stream, substrate)
+
+        substrate = stream
 
         if "substrateFun" in options:
             origSubstrateFun = options["substrateFun"]

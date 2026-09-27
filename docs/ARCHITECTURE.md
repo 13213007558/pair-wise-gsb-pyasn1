@@ -65,7 +65,7 @@ here.
 
 ### Module map
 
-The package is thirty-two modules; four carry most of the weight:
+The package is thirty-three modules; four carry most of the weight:
 `type/univ.py` (~3,300 lines), `codec/ber/decoder.py` (~2,200),
 `codec/ber/encoder.py` (~960), `type/constraint.py` (~750).
 
@@ -84,6 +84,7 @@ The package is thirty-two modules; four carry most of the weight:
 | `type/error.py` | A *second* `ValueConstraintError`, the one actually raised |
 | `codec/streaming.py` | `asSeekableStream`, `CachingStreamWrapper`, `readFromStream`: the resumable-stream engine |
 | `codec/ber/decoder.py` | The base decoder: payload decoders, the state machine, every security limit |
+| `codec/ber/rawview.py` | `RawView`: optional side table recording raw tag/length/value/TLV offsets of decoded items |
 | `codec/ber/encoder.py` | The base encoder |
 | `codec/ber/eoo.py` | The end-of-octets singleton |
 | `codec/cer/*`, `codec/der/*` | Derived codecs, sharing BER's objects by identity |
@@ -1609,6 +1610,59 @@ failure is non-fatal: logged and skipped, raw octets left in place (the
 inner `except KeyError` around the `namedType.openType[governingValue]`
 lookup).
 
+### Raw encoding view
+
+Signature verification needs the exact octets that were received, because
+re-encoding is not guaranteed to reproduce them (a long-form length, a
+padded INTEGER or an indefinite-length container all canonicalize away).
+Passing `rawView=RawView()` to `decode()` or `StreamingDecoder`
+(`pyasn1/codec/ber/rawview.py`, re-exported from
+`pyasn1/codec/ber/decoder.py`) records, for every decoded item, the
+offsets of its tag, length, value and complete TLV as found in the input,
+queryable afterwards by field path. CER and DER inherit the hooks from the
+BER decoder, so the option works there unchanged.
+
+The view is a side table keyed by object identity, not metadata on the
+ASN.1 objects: value equality and `isSameTypeWith` are untouched, and
+nothing about the decoded tree changes when the option is on
+(`RawViewDefiniteLengthTestCase.testDecodedValuesUnchanged`,
+`tests/codec/ber/test_rawview.py`). `SingleItemDecoder.__call__` pushes a
+frame via `rawView._open()` after the end-of-octets probe (so the EOC
+sentinel itself is never recorded) and captures `tagStart`/`tagEnd`/
+`valueStart` at the `stDecodeLength`/`stGetValueDecoder` transitions;
+on completion `rawView._close()` pairs the frame with the yielded object.
+For indefinite-length items the value decoder consumes the terminating
+end-of-octets marker before returning, so the recorded TLV range includes
+the item's own EOC. Paths resolve by walking the decoded tree with
+`getComponentByPosition(idx, instantiate=False)` and matching identity in
+the view's index, which is why SET reordering and OPTIONAL skips need no
+special casing.
+
+Spans index into `RawSource` objects. Source 0 is the decode substrate:
+for bytes-like input the view keeps a `memoryview` of the caller's buffer
+and slices are zero-copy; for stream input the view retains nothing and the
+caller saves octets through the `sink(offset, data)` callback the stream
+is tee'd into (`_TeeStream`), owning that copy itself. A further source
+appears whenever an ANY is re-decoded as an open type: the fresh stream
+(`asSeekableStream(...asOctets())`, see
+[Deferred typing: ANY and open types](#deferred-typing-any-and-open-types))
+is registered by `rawView._derive()` with `parent` pointing at the ANY
+span, so `RawView.spans()` returns both layers -- the ANY as received and
+the re-decoded value relative to the ANY octets -- and
+`RawView.absolute()` maps the inner layer back onto the received buffer.
+Explicit tagging likewise yields two layers at one path: the wrapper TLV
+and the inner value are recorded by two nested `SingleItemDecoder.__call__`
+invocations yielding the same object, and are never merged into one range.
+Consecutive top-level objects decoded by one `StreamingDecoder` share
+source 0, so the second object's offsets continue where the first ended.
+
+Ownership rules are part of the contract: the view holds strong references
+to the decoded objects, the source buffers and the decode streams until
+`RawView.clear()`; octets reported through `sink` are owned by the
+caller and never retained. Non-seekable stream substrates are best-effort
+only, because `CachingStreamWrapper` positions reset when its cache is
+trimmed.
+
 ### Bounding nesting depth
 
 Counting stack frames cannot bound this decoder: the "recursion" is a chain
@@ -1882,4 +1936,3 @@ them as a drive-by; each needs its own dedicated change with tests.
   literal text. Not worth a churn-heavy rewrite mid-release; if ever fixed,
   do it as a dedicated pass verified with `tox -e docs`, since the file is
   compiled into the `-W` build.
-
