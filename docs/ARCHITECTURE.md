@@ -65,7 +65,7 @@ here.
 
 ### Module map
 
-The package is thirty-two modules; four carry most of the weight:
+The package is thirty-three modules; four carry most of the weight:
 `type/univ.py` (~3,300 lines), `codec/ber/decoder.py` (~2,200),
 `codec/ber/encoder.py` (~960), `type/constraint.py` (~750).
 
@@ -86,6 +86,7 @@ The package is thirty-two modules; four carry most of the weight:
 | `codec/ber/decoder.py` | The base decoder: payload decoders, the state machine, every security limit |
 | `codec/ber/encoder.py` | The base encoder |
 | `codec/ber/eoo.py` | The end-of-octets singleton |
+| `codec/ber/rawview.py` | `RawView`: received-byte ranges of decoded TLVs, by object or field path |
 | `codec/cer/*`, `codec/der/*` | Derived codecs, sharing BER's objects by identity |
 | `codec/native/*` | Conversion to and from Python dicts, lists and scalars |
 | `compat/integer.py` | A single `to_bytes` helper |
@@ -1663,6 +1664,59 @@ not. A stack-frame count in place of the counter re-introduces
 `NestingDepthLimitTestCase` mirrors in `tests/codec/cer/test_decoder.py`
 and `tests/codec/der/test_decoder.py`.
 
+### The raw encoding view
+
+Signature verification needs the exact bytes a structure arrived in, and
+re-encoding is not guaranteed to reproduce them: any non-canonical but
+legal BER (a long-form length, a non-minimal INTEGER, an indefinite-length
+container) decodes fine and re-encodes to different octets. The optional
+raw encoding view (`codec/ber/rawview.py`, `RawView`) closes that gap.
+Pass an instance as the `rawView` decode option and every completed
+`SingleItemDecoder.__call__` records a `RawSpan` for the object it
+yields: the absolute offsets of the tag, length and value octets and of
+the full TLV, which for an indefinite-length TLV includes the trailing
+end-of-octets marker (the value range excludes it). The view keys spans
+by object identity and keeps its own references, so nothing is attached
+to the decoded objects and ASN.1 value equality is untouched.
+`RawView.spanFor`/`spansFor` look spans up by object,
+`RawView.lookup(root, path)` walks a field path of component positions
+and names first. The hooks in `ber/decoder.py` are inert when the
+option is absent and, riding the shared state machine, serve CER and DER
+unchanged.
+
+The coordinate spaces are explicit, and there can be several per decode.
+Each substrate stream the decoder reads from gets a `RawSourceLayer`;
+spans are absolute within their layer, which is why the second top-level
+object of a `StreamingDecoder` run keeps offsets measured from the
+start of the stream. Two situations create extra spans or layers, and
+both are load-bearing:
+
+- **Explicit tagging** decodes the wrapper and the inner value in two
+  nested `__call__` passes that yield the *same* object, so the object
+  collects one span per nesting level, innermost first
+  (`spansFor`); `spanFor` returns the outermost wrapper, the TLV as
+  it appeared on the wire. The wrapper and the inner value never share a
+  range.
+- **ANY re-decoded as an open type** reads from a fresh stream over the
+  ANY octets, so the inner TLVs live in a child layer whose
+  `parentSpan` points back at the ANY span in the original source; the
+  open-type loops in `ConstructedPayloadDecoderBase` call
+  `RawView.linkNextSource` to forge that link. Both layers stay
+  queryable after the ANY component is replaced by the resolved object.
+
+Ownership of the source octets is the caller-visible part of the
+contract. Bytes-like substrates are adapted so spans slice the caller's
+original buffer zero-copy (`memoryview`); the view merely borrows it.
+Stream substrates are wrapped in `RecordingStream` before
+`asSeekableStream` runs, which records consumed input and keeps
+offsets absolute, sidestepping the `CachingStreamWrapper` renumbering
+described under [Normalizing input to a seekable
+stream](#normalizing-input-to-a-seekable-stream); the
+`onRawEncoding` callback hands each completed TLV's bytes to the
+caller, who owns saving whatever must outlive the decode.
+`RawView.release()` drops the view's references to the source octets:
+ranges stay queryable, octet accessors raise `PyAsn1Error`.
+
 ## Security hardening inventory
 
 The build order ends with the stream; what remains is inventory, and the
@@ -1882,4 +1936,3 @@ them as a drive-by; each needs its own dedicated change with tests.
   literal text. Not worth a churn-heavy rewrite mid-release; if ever fixed,
   do it as a dedicated pass verified with `tox -e docs`, since the file is
   compiled into the `-W` build.
-

@@ -1,6 +1,16 @@
 Revision 0.7.0, released XX-XX-2026
 ---------------------------------------
 
+- Added an optional raw encoding view to the BER/CER/DER decoders.
+  Passing `rawView=pyasn1.codec.ber.rawview.RawView()` to a decoder
+  records the received byte ranges (tag, length, value and full TLV) of
+  every decoded object, queryable by object or by field path without
+  affecting ASN.1 value equality. Definite and indefinite lengths are
+  supported (the full range of an indefinite-length TLV includes its
+  end-of-octets marker), explicit tag wrappers keep a span of their
+  own, ANY values re-decoded as open types retain both the outer and
+  the inner source layer, bytes-like substrates yield zero-copy slices
+  and stream substrates report the received bytes through a callback.
 - Fixed OverflowError from BER/CER/DER length values that fit in the
   supported 8-octet length field but exceed the platform maximum readable
   size. Such oversized definite lengths are now rejected with PyAsn1Error.

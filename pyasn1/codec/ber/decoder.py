@@ -882,6 +882,12 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                                 for pos, containerElement in enumerate(
                                         containerValue):
 
+                                    rawView = options.get('rawView')
+
+                                    if rawView is not None:
+                                        rawView.linkNextSource(
+                                            containerValue[pos])
+
                                     stream = asSeekableStream(containerValue[pos].asOctets())
 
                                     for component in decodeFun(stream, asn1Spec=openType, **options):
@@ -891,6 +897,11 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                                     containerValue[pos] = component
 
                             else:
+                                rawView = options.get('rawView')
+
+                                if rawView is not None:
+                                    rawView.linkNextSource(containerValue)
+
                                 stream = asSeekableStream(asn1Object.getComponentByPosition(idx).asOctets())
 
                                 for component in decodeFun(stream, asn1Spec=openType, **options):
@@ -1101,6 +1112,12 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                                 for pos, containerElement in enumerate(
                                         containerValue):
 
+                                    rawView = options.get('rawView')
+
+                                    if rawView is not None:
+                                        rawView.linkNextSource(
+                                            containerValue[pos])
+
                                     stream = asSeekableStream(containerValue[pos].asOctets())
 
                                     for component in decodeFun(stream, asn1Spec=openType,
@@ -1114,7 +1131,13 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                                     containerValue[pos] = component
 
                             else:
+                                rawView = options.get('rawView')
+
+                                if rawView is not None:
+                                    rawView.linkNextSource(containerValue)
+
                                 stream = asSeekableStream(asn1Object.getComponentByPosition(idx).asOctets())
+
                                 for component in decodeFun(stream, asn1Spec=openType,
                                                            **dict(options, allowEoo=True)):
                                     if isinstance(component, SubstrateUnderrunError):
@@ -1616,6 +1639,11 @@ class SingleItemDecoder(object):
 
         substrate.markedPosition = substrate.tell()
 
+        rawView = options.get('rawView')
+
+        if rawView is not None:
+            tlvStart = tagEnd = valueStart = substrate.tell()
+
         while state is not stStop:
 
             if state is stDecodeTag:
@@ -1688,6 +1716,9 @@ class SingleItemDecoder(object):
                 else:
                     tagSet = lastTag + tagSet
 
+                if rawView is not None:
+                    tagEnd = substrate.tell()
+
                 state = stDecodeLength
 
                 if LOG:
@@ -1740,6 +1771,9 @@ class SingleItemDecoder(object):
 
                 if length == -1 and not self.supportIndefLength:
                     raise error.PyAsn1Error('Indefinite length encoding not supported by this codec')
+
+                if rawView is not None:
+                    valueStart = substrate.tell()
 
                 state = stGetValueDecoder
 
@@ -1937,6 +1971,20 @@ class SingleItemDecoder(object):
             debug.scope.pop()
             LOG('decoder left scope %s, call completed' % debug.scope)
 
+        if rawView is not None:
+            tlvEnd = substrate.tell()
+
+            if length == -1:  # indef length TLV spans include their EOC
+                valueEnd = tlvEnd - 2
+
+            else:
+                valueEnd = tlvEnd
+
+            rawView._record(
+                substrate, value, tlvStart, tagEnd, valueStart,
+                valueEnd, tlvEnd, length == -1
+            )
+
         yield value
 
 
@@ -2019,6 +2067,12 @@ class StreamingDecoder(object):
 
     def __init__(self, substrate, asn1Spec=None, **options):
         self._singleItemDecoder = self.SINGLE_ITEM_DECODER(**options)
+
+        rawView = options.get('rawView')
+
+        if rawView is not None:
+            substrate = rawView.adaptSubstrate(substrate)
+
         self._substrate = asSeekableStream(substrate)
         self._asn1Spec = asn1Spec
         self._options = options
@@ -2126,6 +2180,11 @@ class Decoder(object):
             1 2 3
 
         """
+        rawView = options.get('rawView')
+
+        if rawView is not None:
+            substrate = rawView.adaptSubstrate(substrate)
+
         substrate = asSeekableStream(substrate)
 
         if "substrateFun" in options:
