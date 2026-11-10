@@ -1656,8 +1656,10 @@ and look the most natural to "clean up".
 
 `options` is simultaneously the nesting counter, the `context` attached to
 `SubstrateUnderrunError`, the `asn1Object` back-reference carrier
-(`AbstractPayloadDecoder._passAsn1Object`), the `allowEoo` channel and the
-user-option pass-through. Adding a key is cheap; removing or renaming one is
+(`AbstractPayloadDecoder._passAsn1Object`), the `allowEoo` channel, the
+decode-budget state (`_decodeBudget`, see [Per-decode
+budgets](#per-decode-budgets)) and the user-option pass-through. Adding a
+key is cheap; removing or renaming one is
 not. A stack-frame count in place of the counter re-introduces
 `RecursionError` and breaks `testWithSchema` in the same class and the
 `NestingDepthLimitTestCase` mirrors in `tests/codec/cer/test_decoder.py`
@@ -1723,6 +1725,59 @@ chain sustains converts a clean `PyAsn1Error` back into `RecursionError`
 `tests/codec/ber/test_decoder.py` pins the distinction). Reverting the OID
 accumulator to tuple concatenation reintroduces CVE-2026-59885 with no test
 failure: the fix changed complexity, not results.
+
+### Per-decode budgets
+
+The hard limits above are module constants: one value protects every
+caller, and tightening them for a single untrusted input would affect the
+whole process. `DecodeBudget` (`pyasn1/codec/ber/decoder.py`, inherited by
+CER and DER through their `SingleItemDecoder` subclasses) is the
+per-request complement: pass `decodeBudget=DecodeBudget(...)` to any
+BER/CER/DER decode entry point to bound three quantities for that one
+top-level decode — decoded elements (`maxElements`), cumulative content
+octets (`maxContentOctets`) and nesting depth (`maxNestingDepth`,
+clamped to `MAX_NESTING_DEPTH`, so a budget can only tighten the hard
+limit, never loosen it).
+
+The mechanism reuses the options-dict channel of the nesting counter.
+When `SingleItemDecoder.__call__` finds no `_decodeBudget` key in its
+options, it snapshots the `DecodeBudget` passed as `decodeBudget` into a
+`_DecodeBudgetState` (limits copied, counters zeroed) and stores it under
+that key; recursive `decodeFun` call sites forward it exactly like
+`_nestingLevel`, so nested components, ANY and open-type payloads,
+constructed-string fragments and indefinite-length containers all draw
+from the same counters and never reset them. The same maintenance rule
+as for the nesting counter applies: a `decodeFun` call that drops
+`**options` silently disarms the budget for everything below it. The
+snapshot is also what makes the configuration object safe to share:
+mutating the `DecodeBudget` after a decode has started cannot change
+that decode's limits, and each `StreamingDecoder` instance (and each
+top-level item it yields, since `StreamingDecoder.__iter__` splats
+`self._options` fresh per item) gets its own counters, so interleaved
+decoders never interfere.
+
+Charging happens at three points in the per-item state machine, each
+before the guarded resource is consumed: one element per TLV at
+`stDecodeTag` entry (end-of-octets markers and the untagged-CHOICE
+re-dispatch, which reads no new TLV, are not charged); the declared
+content length of every primitive (non-constructed) TLV at
+`stDecodeLength`, before the value octets are read — constructed
+containers charge nothing at their header because their components and
+fragments charge themselves as they decode, and open-type resolution
+charges the payload octets a second time because it decodes them a
+second time; and the nesting-depth check at generator entry. Because
+charges are statements in the suspended generator, a streaming decode
+that pauses on `SubstrateUnderrunError` resumes after them rather than
+re-executing them, so retried reads are never charged twice. Exceeding a
+limit raises `PyAsn1Error` with a `Decode budget exceeded: ...` message
+naming the category; the exception propagates out of
+`StreamingDecoder.__iter__`, so the remaining bytes are never mistaken
+for the next message, while an ordinary short read remains a
+recoverable underrun.
+
+Tests live in `tests/codec/ber/test_decoder_budget.py` (registered in
+`tests/codec/ber/__main__.py`), with rejection mirrors in
+`tests/codec/cer/test_decoder.py` and `tests/codec/der/test_decoder.py`.
 
 ### Encoder guards
 

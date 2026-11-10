@@ -15,6 +15,7 @@ from pyasn1.type import opentype
 from pyasn1.type import univ
 from pyasn1.codec.cer import decoder
 from pyasn1.codec.cer import encoder
+from pyasn1.codec.ber.decoder import DecodeBudget
 from pyasn1.error import PyAsn1Error
 
 
@@ -451,6 +452,40 @@ class NestingDepthLimitTestCase(BaseTestCase):
         except RecursionError:
             assert False, 'Got RecursionError instead of PyAsn1Error'
 
+
+
+class DecodeBudgetTestCase(BaseTestCase):
+    # SET (31) of five NULLs: one element for the container plus one
+    # per NULL, 6 in total; no content octets
+    substrate = bytes((0x31, 10) + (0x05, 0x00) * 5)
+
+    def testAtLimitDecodes(self):
+        s, r = decoder.decode(
+            self.substrate, decodeBudget=DecodeBudget(maxElements=6))
+
+        assert not r
+        assert len(s) == 5
+
+    def testOneOverLimitRejected(self):
+        try:
+            decoder.decode(
+                self.substrate, decodeBudget=DecodeBudget(maxElements=5))
+        except PyAsn1Error as exc:
+            assert 'element' in str(exc)
+        else:
+            assert False, 'Excessive decoded elements tolerated'
+
+    def testNestingDepthOverLimitRejected(self):
+        # SEQUENCE { SEQUENCE { INTEGER 5 } }: nesting levels 0, 1, 2
+        substrate = bytes((0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x05))
+
+        try:
+            decoder.decode(
+                substrate, decodeBudget=DecodeBudget(maxNestingDepth=1))
+        except PyAsn1Error as exc:
+            assert 'nesting depth' in str(exc)
+        else:
+            assert False, 'Excessive nesting depth tolerated'
 
 suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
 

@@ -21,6 +21,14 @@ Revision 0.7.0, released XX-XX-2026
   qualifies for a private advisory and a CVE versus what is handled
   as an ordinary public bug report
   [issue #96](https://github.com/pyasn1/pyasn1/issues/96)
+- Added optional per-decode resource budgets to the BER/CER/DER decoders.
+  Passing ``decodeBudget=DecodeBudget(...)`` to any decode entry point
+  bounds the number of decoded elements, the cumulative content octets
+  and the nesting depth of a single top-level decode, only tightening
+  (never loosening) the built-in decoder limits. The budget is shared
+  with all nested subdecodes, including ANY/open type payloads,
+  constructed strings and indefinite-length containers, and exceeding it
+  raises PyAsn1Error naming the exhausted budget category
 
 Revision 0.6.5, released 26-10-2026
 ---------------------------------------

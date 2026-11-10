@@ -97,7 +97,11 @@ downstream callers depend on. Rationale in
   exception.
 - **Forward the options dict.** Recursion depth rides in
   `options['_nestingLevel']`, not the call stack; a freshly built options dict
-  defeats the nesting-depth fix.
+  defeats the nesting-depth fix. The per-decode budget state rides the same
+  dict as `options['_decodeBudget']` (snapshot of the `DecodeBudget` passed
+  as `decodeBudget=`): a `decodeFun` call that drops `**options` silently
+  disarms both limits for everything below it. Budgets only tighten the hard
+  limits (`maxNestingDepth` is clamped to `MAX_NESTING_DEPTH`).
 - **The streaming idiom is load-bearing.** Reads are written as `for chunk in
   readFromStream(...): if isinstance(chunk, SubstrateUnderrunError): yield chunk`
   then use the leaked loop variable. Rewriting it as `next()` or a

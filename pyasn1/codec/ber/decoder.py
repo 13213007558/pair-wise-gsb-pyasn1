@@ -25,7 +25,7 @@ from pyasn1.type import tagmap
 from pyasn1.type import univ
 from pyasn1.type import useful
 
-__all__ = ['StreamingDecoder', 'Decoder', 'decode']
+__all__ = ['DecodeBudget', 'StreamingDecoder', 'Decoder', 'decode']
 
 LOG = debug.registerLoggee(__name__, flags=debug.DEBUG_DECODER)
 
@@ -44,6 +44,135 @@ MAX_NESTING_DEPTH = 100
 
 # Maximum number of bytes in a BER length field (8 bytes = up to 2^64-1)
 MAX_LENGTH_OCTETS = 8
+
+
+class DecodeBudget(object):
+    """Per-decode resource budget for BER/CER/DER decoding.
+
+    A budget bounds the resources a single top-level decode may consume.
+    Pass an instance as the ``decodeBudget`` keyword argument to
+    :class:`Decoder`, :class:`StreamingDecoder` or ``decode()`` (the CER
+    and DER entry points accept it as well). The budget is shared by the
+    top-level item and everything decoded underneath it: nested
+    components, ANY and open-type payloads, constructed string fragments
+    and indefinite-length containers all draw from the same counters and
+    never reset them. Each new top-level item, and each
+    :class:`StreamingDecoder` instance, gets fresh counters, so
+    interleaved decoders never share a budget.
+
+    The limits are snapshotted when a top-level decode starts: mutating
+    the :class:`DecodeBudget` object afterwards does not affect decodes
+    already in progress, only ones started later.
+
+    All three limits are optional; ``None`` leaves the quantity bounded
+    only by the hard decoder limits. A budget can only tighten the hard
+    limits: ``maxNestingDepth`` is clamped to ``MAX_NESTING_DEPTH``.
+
+    Charging rules
+    --------------
+    Elements: one per TLV item read from the substrate, charged when its
+    tag is about to be decoded. End-of-octets markers of indefinite-length
+    items are not elements. An untagged CHOICE re-dispatch reads no new
+    TLV and is not charged again.
+
+    Content octets: the content length of every primitive (non-constructed)
+    TLV, charged once when its length field is decoded, before the value
+    octets are read. Constructed containers charge nothing at their
+    header; their components and constructed-string fragments charge
+    themselves as they decode. Open-type resolution decodes the payload
+    octets a second time and charges them a second time.
+
+    Nesting depth: the existing ``_nestingLevel`` counter, checked against
+    the budget on every recursive decoder entry.
+
+    Counters increase monotonically within a top-level decode; a streaming
+    decode that pauses on
+    :py:class:`~pyasn1.error.SubstrateUnderrunError` resumes without
+    re-charging what was already accounted for.
+
+    Exceeding any limit raises :py:class:`~pyasn1.error.PyAsn1Error`
+    naming the exhausted category, before the corresponding value is
+    read or expanded.
+
+    Parameters
+    ----------
+    maxElements: :py:class:`int` or None
+        Maximum number of TLV items decoded per top-level decode.
+
+    maxContentOctets: :py:class:`int` or None
+        Maximum cumulative number of primitive content octets decoded
+        per top-level decode.
+
+    maxNestingDepth: :py:class:`int` or None
+        Maximum ASN.1 structure nesting depth per top-level decode,
+        clamped to ``MAX_NESTING_DEPTH``.
+    """
+
+    def __init__(self, maxElements=None, maxContentOctets=None,
+                 maxNestingDepth=None):
+        for limitName, limitValue in (
+                ('maxElements', maxElements),
+                ('maxContentOctets', maxContentOctets),
+                ('maxNestingDepth', maxNestingDepth)):
+            if limitValue is None:
+                continue
+
+            if not isinstance(limitValue, int) or limitValue < 0:
+                raise error.PyAsn1Error(
+                    'Decode budget %s must be a non-negative integer or '
+                    'None, got %r' % (limitName, limitValue))
+
+        self.maxElements = maxElements
+        self.maxContentOctets = maxContentOctets
+
+        if maxNestingDepth is None:
+            self.maxNestingDepth = None
+
+        else:
+            self.maxNestingDepth = min(maxNestingDepth, MAX_NESTING_DEPTH)
+
+
+class _DecodeBudgetState(object):
+    """Live budget counters for one top-level decode.
+
+    Snapshots the limits of a :class:`DecodeBudget` so that mutating the
+    configuration object mid-decode cannot change in-progress limits.
+    """
+
+    __slots__ = ('maxElements', 'maxContentOctets', 'maxNestingDepth',
+                 'elementsUsed', 'contentOctetsUsed')
+
+    def __init__(self, budget):
+        self.maxElements = budget.maxElements
+        self.maxContentOctets = budget.maxContentOctets
+        self.maxNestingDepth = budget.maxNestingDepth
+        self.elementsUsed = 0
+        self.contentOctetsUsed = 0
+
+    def chargeElement(self):
+        self.elementsUsed += 1
+
+        if (self.maxElements is not None and
+                self.elementsUsed > self.maxElements):
+            raise error.PyAsn1Error(
+                'Decode budget exceeded: decoded element count %d over '
+                'limit %d' % (self.elementsUsed, self.maxElements))
+
+    def chargeContentOctets(self, octetCount):
+        self.contentOctetsUsed += octetCount
+
+        if (self.maxContentOctets is not None and
+                self.contentOctetsUsed > self.maxContentOctets):
+            raise error.PyAsn1Error(
+                'Decode budget exceeded: content octets %d over '
+                'limit %d' % (self.contentOctetsUsed, self.maxContentOctets))
+
+    def checkNestingDepth(self, nestingLevel):
+        if (self.maxNestingDepth is not None and
+                nestingLevel > self.maxNestingDepth):
+            raise error.PyAsn1Error(
+                'Decode budget exceeded: nesting depth %d over '
+                'limit %d' % (nestingLevel, self.maxNestingDepth))
 
 
 class AbstractPayloadDecoder(object):
@@ -1603,6 +1732,18 @@ class SingleItemDecoder(object):
 
         _nestingLevel = options.get('_nestingLevel', 0)
 
+        budget = options.get('_decodeBudget')
+
+        if budget is None:
+            decodeBudget = options.get('decodeBudget')
+
+            if decodeBudget is not None:
+                budget = _DecodeBudgetState(decodeBudget)
+                options['_decodeBudget'] = budget
+
+        if budget is not None:
+            budget.checkNestingDepth(_nestingLevel)
+
         if _nestingLevel > MAX_NESTING_DEPTH:
             raise error.PyAsn1Error(
                 'ASN.1 structure nesting depth exceeds limit (%d)' % MAX_NESTING_DEPTH
@@ -1645,6 +1786,9 @@ class SingleItemDecoder(object):
         while state is not stStop:
 
             if state is stDecodeTag:
+                if budget is not None:
+                    budget.chargeElement()
+
                 # Decode tag
                 isShortTag = True
 
@@ -1766,6 +1910,10 @@ class SingleItemDecoder(object):
 
                 if length == -1 and not self.supportIndefLength:
                     raise error.PyAsn1Error('Indefinite length encoding not supported by this codec')
+
+                if (budget is not None and length > 0 and
+                        tagSet[0].tagFormat != tag.tagFormatConstructed):
+                    budget.chargeContentOctets(length)
 
                 state = stGetValueDecoder
 
@@ -1987,6 +2135,12 @@ class StreamingDecoder(object):
         me required is that ASN.1 structure is encoded in the *IMPLICIT*
         tagging mode.
 
+    decodeBudget: :py:class:`DecodeBudget`
+        Optional resource budget bounding the number of decoded elements,
+        cumulative content octets and nesting depth. Each top-level item
+        decoded by this iterator draws on a fresh snapshot of the budget;
+        the counters are shared with all its nested subdecodes.
+
     Yields
     ------
     : :py:class:`~pyasn1.type.base.PyAsn1Item`, :py:class:`~pyasn1.error.SubstrateUnderrunError`
@@ -2115,6 +2269,10 @@ class Decoder(object):
             decode passes as 2nd item.
             The streaming variant shall yield an object that will be propagated as
             decode() return value, and leave the remaining payload in the stream.
+
+        decodeBudget: :py:class:`DecodeBudget`
+            Optional resource budget bounding the number of decoded elements,
+            cumulative content octets and nesting depth of this decode.
 
         Returns
         -------
