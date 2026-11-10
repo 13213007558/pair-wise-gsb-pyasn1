@@ -63,6 +63,32 @@ class CachingStreamWrapperTestCase(BaseTestCase):
         assert wrapper.markedPosition == 0
         assert len(wrapper._cache.getvalue()) == 0
 
+    def testAbsolutePositionSurvivesCacheReset(self):
+        wrapper = streaming.CachingStreamWrapper(self.longStream)
+        wrapper.read(10)
+        wrapper.markedPosition = wrapper.tell()
+
+        # Reach the maximum capacity of cache
+        wrapper.read(io.DEFAULT_BUFFER_SIZE)
+
+        # The following should clear the cache and re-base tell()
+        wrapper.markedPosition = wrapper.tell()
+        assert wrapper.tell() == 0
+
+        assert wrapper.absolutePosition == 10 + io.DEFAULT_BUFFER_SIZE
+
+        wrapper.read(5)
+        assert wrapper.absolutePosition == 15 + io.DEFAULT_BUFFER_SIZE
+
+    def testGetAbsolutePosition(self):
+        wrapper = streaming.CachingStreamWrapper(self.shortStream)
+        wrapper.read(4)
+        assert streaming.getAbsolutePosition(wrapper) == 4
+
+        stream = io.BytesIO(self.shortText)
+        stream.read(4)
+        assert streaming.getAbsolutePosition(stream) == 4
+
 
 suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
 

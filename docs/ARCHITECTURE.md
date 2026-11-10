@@ -1307,7 +1307,12 @@ each item, and once the cache exceeds `io.DEFAULT_BUFFER_SIZE` the
 `tell()` restarts at 0. On a wrapped stream, positions saved across an item
 boundary are not stale, they are invalid: the coordinate system shifted
 underneath them. Code that stashes `tell()` across items passes every
-`bytes`-based test and reads garbage on wrapped streams. The cache-drop
+`bytes`-based test and reads garbage on wrapped streams. The monotonic
+alternative is the wrapper's `absolutePosition` property, which adds the
+count of discarded bytes back in; `getAbsolutePosition` (`streaming.py`)
+hides the distinction, returning `absolutePosition` where it exists and
+`tell()` elsewhere, and is what the span recorder measures offsets with
+([Recording TLV spans](#recording-tlv-spans)). The cache-drop
 threshold is an interpreter constant (131072 on CPython 3.14), not a pyasn1
 one. Lowering it breaks the constructed decoders' position arithmetic (the
 `while substrate.tell() - original_position < length` loops in
@@ -1522,6 +1527,66 @@ that signature verification depends on not happening. Symmetry in the
 `NonStreamingCompatibilityTestCase.testPartialDecodeWithDefaultSubstrateFun`
 (`tests/codec/ber/test_decoder.py`), whose synthesized callback is written
 to read zero bytes of a 14-byte value.
+
+### Recording TLV spans
+
+Decoding is lossy about provenance: a decoded value carries no hint of
+where its serialization sat in the input, and re-encoding need not
+reproduce the received bytes (BER admits indefinite lengths, long-form
+lengths and constructed strings that DER would canonicalize away).
+Signature verification needs those exact bytes, so the decoder grows an
+optional side channel rather than a new return value: the `spanFun`
+option, a callback of `(asn1Object, start, end)` fired once per decoded
+object right after its TLV is fully consumed. Offsets are end-exclusive,
+cover identifier, length and contents octets (plus the end-of-contents
+octets of an indefinite-length TLV), and are relative to the stream
+position at `StreamingDecoder` construction, so every top-level item of
+one stream shares one coordinate space. Children are reported before
+their containers. The mechanism is `SpanRecorder` (`ber/decoder.py`),
+created in `StreamingDecoder.__init__` (or lazily in
+`SingleItemDecoder.__call__` when the streaming layer is bypassed) and
+threaded through `options` as `_spanRecorder`; CER and DER inherit it
+with the rest of the BER pipeline. With no `spanFun` there is no
+recorder, no per-item bookkeeping, and the decode contract is untouched.
+
+Two design constraints shape the implementation. First, offsets must
+survive streaming: `CachingStreamWrapper` re-bases `tell()` when it
+drops its cache, so spans are measured with `getAbsolutePosition`
+(`streaming.py`), which adds the wrapper's monotonic `absolutePosition`
+on top of the discarded-byte count. Second, the record must not pin the
+input: the recorder stores only integer offsets, and its transient
+`id(object) -> span` table (consulted solely by open type re-decoding,
+below) dies with the decode call. Holding the substrate and slicing it
+is the caller's job.
+
+Node correspondence is by object identity, which is what makes anonymous
+members work: the object handed to `spanFun` is the very object stored
+into the parent (`setComponentByPosition` with `matchTags=False` stores,
+never clones), so schema-guided components are looked up by name,
+schemaless and `SequenceOf` members by position. An explicitly tagged
+value is reported once per tag layer, innermost first, because the
+explicit-tag recovery re-enters `decodeFun` for the inner TLV; the last
+report for an object covers its full outer TLV. Open types are the one
+place offsets would otherwise lie: the resolved value is re-decoded from
+a fresh stream over the `ANY` component's captured octets, where
+position zero is not the input's position zero. `_rebaseSpanRecorder`
+(`ber/decoder.py`) shifts the recorder's origin by the negated span
+start of the component being re-decoded, so the replacement object and
+its children land in the original input's coordinates; nested open types
+compose because every recorded span is already in final coordinates.
+One more coordinate fix-up rides in `options` as `_spanStart`: the
+untagged-CHOICE re-dispatch (`ChoicePayloadDecoder.valueDecoder`) re-enters
+`SingleItemDecoder.__call__` with a non-initial `state`, the tag and
+length octets of the component's TLV already consumed by the parent
+frame, so a re-dispatched call inherits the parent's TLV start instead
+of measuring from mid-TLV. Calls entering at `stDecodeTag` always
+measure their own start and overwrite the key for their children, so
+the inherited value never leaks sideways into sibling subtrees.
+`SignatureEnvelopeExampleTestCase`
+(`tests/codec/ber/test_decoder_span.py`) is the worked example: an
+envelope wrapping a nested payload, its digest recomputed over the
+span-sliced bytes, and two wire forms with equal decoded values that
+spans still tell apart.
 
 ### Two framing modes
 

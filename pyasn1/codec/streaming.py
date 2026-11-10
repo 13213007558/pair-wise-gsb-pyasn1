@@ -24,6 +24,9 @@ class CachingStreamWrapper(io.IOBase):
         self._raw = raw
         self._cache = io.BytesIO()
         self._markedPosition = 0
+        # Absolute offset of cache position zero within the original
+        # input. Bumped every time the cache is dropped and re-based.
+        self._droppedBytes = 0
 
     def peek(self, n):
         result = self.read(n)
@@ -71,11 +74,22 @@ class CachingStreamWrapper(io.IOBase):
         # that we will not return back, and thus it is
         # safe to drop all cached data.
         if self._cache.tell() > io.DEFAULT_BUFFER_SIZE:
+            self._droppedBytes += self._cache.tell()
             self._cache = io.BytesIO(self._cache.read())
             self._markedPosition = 0
 
     def tell(self):
         return self._cache.tell()
+
+    @property
+    def absolutePosition(self):
+        """Read position relative to the beginning of the original input.
+
+        Unlike :py:meth:`tell`, this position keeps growing monotonically
+        even when the internal cache is dropped and the stream is
+        re-based, so it can be safely compared across item boundaries.
+        """
+        return self._droppedBytes + self._cache.tell()
 
 
 def asSeekableStream(substrate):
@@ -114,6 +128,31 @@ def asSeekableStream(substrate):
         raise error.UnsupportedSubstrateError(
             "Cannot convert " + substrate.__class__.__name__ +
             " to a seekable bit stream.")
+
+
+def getAbsolutePosition(substrate):
+    """Return the monotonic read position of a substrate stream.
+
+    For plain seekable streams this is just ``tell()``. For
+    :py:class:`CachingStreamWrapper` the position stays relative to the
+    beginning of the original input even after the wrapper drops its
+    cache and re-bases ``tell()``, so positions taken before and after
+    a cache reset remain comparable.
+
+    Parameters
+    ----------
+    substrate: :py:class:`IOBase`
+        Stream to query
+
+    Returns
+    -------
+    : :py:class:`int`
+    """
+    try:
+        return substrate.absolutePosition
+
+    except AttributeError:
+        return substrate.tell()
 
 
 def isEndOfStream(substrate):

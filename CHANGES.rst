@@ -1,6 +1,14 @@
 Revision 0.7.0, released XX-XX-2026
 ---------------------------------------
 
+- Added optional TLV span recording to the BER/CER/DER decoders. Passing
+  a ``spanFun`` callback to ``decode()`` or ``StreamingDecoder`` invokes
+  it once per decoded ASN.1 object with the ``(start, end)`` offsets of
+  the object's original serialization (identifier, length and contents
+  octets, plus end-of-contents octets for indefinite-length objects),
+  relative to the start of the input. The decoder keeps no reference to
+  the input bytes; the caller slices the substrate it already holds,
+  e.g. to verify a signature over the exact transmitted bytes
 - Fixed OverflowError from BER/CER/DER length values that fit in the
   supported 8-octet length field but exceed the platform maximum readable
   size. Such oversized definite lengths are now rejected with PyAsn1Error.

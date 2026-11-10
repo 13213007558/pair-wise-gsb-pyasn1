@@ -13,6 +13,7 @@ from pyasn1 import debug
 from pyasn1 import error
 from pyasn1.codec.ber import eoo
 from pyasn1.codec.streaming import asSeekableStream
+from pyasn1.codec.streaming import getAbsolutePosition
 from pyasn1.codec.streaming import isEndOfStream
 from pyasn1.codec.streaming import peekIntoStream
 from pyasn1.codec.streaming import readFromStream
@@ -44,6 +45,75 @@ MAX_NESTING_DEPTH = 100
 
 # Maximum number of bytes in a BER length field (8 bytes = up to 2^64-1)
 MAX_LENGTH_OCTETS = 8
+
+
+class SpanRecorder(object):
+    """Dispatch TLV span reports to the user-supplied callback.
+
+    A span is a pair of ``(start, end)`` offsets, end-exclusive, covering
+    the identifier, length and contents octets of one decoded TLV (plus
+    the end-of-contents octets of an indefinite-length TLV). Offsets are
+    relative to the position of the input stream at the moment the
+    decoding started and remain valid across streaming pauses, resumes
+    and input buffer compaction.
+
+    The recorder keeps no reference to the input: it only stores integer
+    offsets, transiently, so that open type re-decoding can re-base
+    itself onto the original input. The caller is responsible for
+    holding on to the original substrate bytes.
+    """
+
+    def __init__(self, spanFun, origin=0, spans=None):
+        self._spanFun = spanFun
+        self._origin = origin
+        # Maps id(asn1Object) -> (start, end) of already decoded nodes.
+        # Transient: only consulted by open type re-decoding while the
+        # decoded tree is still alive, then dropped with the decode call.
+        self._spans = spans if spans is not None else {}
+
+    def record(self, asn1Object, start, end):
+        """Re-base *start*/*end* to the origin and report the span."""
+        start -= self._origin
+        end -= self._origin
+
+        self._spans[id(asn1Object)] = (start, end)
+        self._spanFun(asn1Object, start, end)
+
+    def spanOf(self, asn1Object):
+        """Return the recorded span of *asn1Object*, or None."""
+        return self._spans.get(id(asn1Object))
+
+    def shifted(self, origin):
+        """Derive a recorder re-based onto a different origin.
+
+        The derived recorder shares the user callback and the span
+        table with this one.
+        """
+        return SpanRecorder(self._spanFun, origin, self._spans)
+
+
+def _rebaseSpanRecorder(options, asn1Object):
+    """Re-base the span recorder in *options* onto *asn1Object*'s span.
+
+    Open type values are re-decoded from a fresh stream holding just the
+    component's own octets. Shifting the recorder origin by the negated
+    span start of that component makes the spans recorded during the
+    re-decode land in the original input's coordinate space.
+
+    Returns *options* unchanged when span recording is off or the
+    component's span is unknown.
+    """
+    spanRecorder = options.get('_spanRecorder')
+
+    if spanRecorder is None:
+        return options
+
+    span = spanRecorder.spanOf(asn1Object)
+
+    if span is None:
+        return options
+
+    return dict(options, _spanRecorder=spanRecorder.shifted(-span[0]))
 
 
 class AbstractPayloadDecoder(object):
@@ -906,7 +976,9 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                                     stream = asSeekableStream(containerValue[pos].asOctets())
 
-                                    for component in decodeFun(stream, asn1Spec=openType, **options):
+                                    for component in decodeFun(
+                                            stream, asn1Spec=openType,
+                                            **_rebaseSpanRecorder(options, containerValue[pos])):
                                         if isinstance(component, SubstrateUnderrunError):
                                             yield component
 
@@ -915,7 +987,9 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                             else:
                                 stream = asSeekableStream(asn1Object.getComponentByPosition(idx).asOctets())
 
-                                for component in decodeFun(stream, asn1Spec=openType, **options):
+                                for component in decodeFun(
+                                        stream, asn1Spec=openType,
+                                        **_rebaseSpanRecorder(options, containerValue)):
                                     if isinstance(component, SubstrateUnderrunError):
                                         yield component
 
@@ -1125,8 +1199,10 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                                     stream = asSeekableStream(containerValue[pos].asOctets())
 
-                                    for component in decodeFun(stream, asn1Spec=openType,
-                                                               **dict(options, allowEoo=True)):
+                                    for component in decodeFun(
+                                            stream, asn1Spec=openType,
+                                            **dict(_rebaseSpanRecorder(
+                                                options, containerValue[pos]), allowEoo=True)):
                                         if isinstance(component, SubstrateUnderrunError):
                                             yield component
 
@@ -1137,8 +1213,10 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                             else:
                                 stream = asSeekableStream(asn1Object.getComponentByPosition(idx).asOctets())
-                                for component in decodeFun(stream, asn1Spec=openType,
-                                                           **dict(options, allowEoo=True)):
+                                for component in decodeFun(
+                                        stream, asn1Spec=openType,
+                                        **dict(_rebaseSpanRecorder(
+                                            options, containerValue), allowEoo=True)):
                                     if isinstance(component, SubstrateUnderrunError):
                                         yield component
 
@@ -1612,6 +1690,15 @@ class SingleItemDecoder(object):
 
         allowEoo = options.pop('allowEoo', False)
 
+        spanRecorder = options.get('_spanRecorder')
+
+        if spanRecorder is None:
+            spanFun = options.get('spanFun')
+
+            if spanFun is not None:
+                spanRecorder = options['_spanRecorder'] = SpanRecorder(
+                    spanFun, getAbsolutePosition(substrate))
+
         if LOG:
             LOG('decoder called at scope %s with state %d, working with up '
                 'to %s octets of substrate: '
@@ -1641,6 +1728,22 @@ class SingleItemDecoder(object):
         value = noValue
 
         substrate.markedPosition = substrate.tell()
+
+        if spanRecorder is not None:
+            if state is stDecodeTag:
+                spanStart = getAbsolutePosition(substrate)
+
+                # Re-dispatched calls (e.g. untagged CHOICE) re-enter with
+                # a non-initial state, the tag and length octets of their
+                # TLV already consumed by this frame: let them inherit
+                # this TLV's start rather than measure from mid-TLV.
+                options['_spanStart'] = spanStart
+
+            else:
+                spanStart = options.get('_spanStart')
+
+                if spanStart is None:
+                    spanStart = getAbsolutePosition(substrate)
 
         while state is not stStop:
 
@@ -1963,6 +2066,9 @@ class SingleItemDecoder(object):
             debug.scope.pop()
             LOG('decoder left scope %s, call completed' % debug.scope)
 
+        if spanRecorder is not None:
+            spanRecorder.record(value, spanStart, getAbsolutePosition(substrate))
+
         yield value
 
 
@@ -1986,6 +2092,20 @@ class StreamingDecoder(object):
         or may not be required. One of the reasons why `asn1Spec` may
         me required is that ASN.1 structure is encoded in the *IMPLICIT*
         tagging mode.
+
+    spanFun: `Callable[[pyasn1.type.base.PyAsn1Item, int, int], None]`
+        User callback invoked once per decoded ASN.1 object, right after
+        its TLV has been fully consumed from the input. The callback
+        receives the decoded object and the `(start, end)` offsets,
+        end-exclusive, of its original serialization: identifier, length
+        and contents octets (plus the end-of-contents octets of an
+        indefinite-length TLV). Offsets are relative to the position of
+        the input stream at the moment this decoder was created and stay
+        valid across streaming pauses and resumes. The decoder does not
+        retain the input bytes: the caller is expected to keep the
+        original substrate and slice it with the reported offsets, e.g.
+        to verify a signature over the exact transmitted bytes. Child
+        objects are reported before their containing objects.
 
     Yields
     ------
@@ -2048,6 +2168,14 @@ class StreamingDecoder(object):
         self._substrate = asSeekableStream(substrate)
         self._asn1Spec = asn1Spec
         self._options = options
+
+        if options.get('spanFun') is not None and '_spanRecorder' not in options:
+            # Pin the span origin to the current stream position so that
+            # all top-level items decoded from this stream share one
+            # coordinate space, stable across streaming pauses and input
+            # buffer compaction.
+            options['_spanRecorder'] = SpanRecorder(
+                options['spanFun'], getAbsolutePosition(self._substrate))
 
     def __iter__(self):
         while True:
@@ -2115,6 +2243,19 @@ class Decoder(object):
             decode passes as 2nd item.
             The streaming variant shall yield an object that will be propagated as
             decode() return value, and leave the remaining payload in the stream.
+
+        spanFun: :py:class:`Callable[[pyasn1.type.base.PyAsn1Item, int, int], None]`
+            User callback invoked once per decoded ASN.1 object, right after
+            its TLV has been fully consumed from the input. The callback
+            receives the decoded object and the `(start, end)` offsets,
+            end-exclusive, of its original serialization: identifier, length
+            and contents octets (plus the end-of-contents octets of an
+            indefinite-length TLV). Offsets are relative to the beginning of
+            the input. The decoder does not retain the input bytes: the caller
+            is expected to keep the original `substrate` and slice it with the
+            reported offsets, e.g. to verify a signature over the exact
+            transmitted bytes. Child objects are reported before their
+            containing objects.
 
         Returns
         -------
