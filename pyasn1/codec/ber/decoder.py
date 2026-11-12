@@ -45,6 +45,46 @@ MAX_NESTING_DEPTH = 100
 # Maximum number of bytes in a BER length field (8 bytes = up to 2^64-1)
 MAX_LENGTH_OCTETS = 8
 
+# Options-dict key carrying the strict DER flag. The flag is opt-in: only the
+# DER codec sets it, and every DER conformance check below is gated on it so
+# BER's legal lenient encodings keep decoding. It rides the same channel as
+# ``_nestingLevel``, so schema-driven, CHOICE, explicit/implicit tag and open
+# type re-decodes all inherit it without touching any shared decoder instance.
+STRICT_DER_OPTION = '_strictDER'
+
+
+def _isStrictDer(options):
+    return bool(options.get(STRICT_DER_OPTION))
+
+
+def _rejectNonMinimalInteger(chunk, tagSet, options):
+    # X.690 8.3.2: the contents octets shall consist of one octet, or of the
+    # minimum number of octets needed to represent the value; the leading
+    # octet and bit 8 of the next octet must not both be all-ones or
+    # all-zeros (i.e. no redundant 0xFF/0x00 sign padding).
+    if not _isStrictDer(options) or len(chunk) < 2:
+        return
+
+    if (chunk[0] == 0x00 and not chunk[1] & 0x80 or
+            chunk[0] == 0xFF and chunk[1] & 0x80):
+        raise error.PyAsn1Error(
+            'Non-minimal INTEGER/ENUMERATED encoding at %s' % (tagSet,))
+
+
+def _rejectNonCanonicalBoolean(chunk, tagSet, options):
+    # X.690 11.1: TRUE is 0xFF and FALSE is 0x00; BER accepts any non-zero
+    # byte as TRUE.
+    if _isStrictDer(options) and chunk[0] not in (0x00, 0xFF):
+        raise error.PyAsn1Error(
+            'Unexpected Boolean payload: %s' % chunk[0])
+
+
+def _rejectNonZeroUnusedBits(chunk, tagSet, options):
+    # X.690 11.2.1: unused bits in the final BIT STRING octet shall be zero.
+    if _isStrictDer(options) and chunk[0] and chunk[-1] & ((1 << chunk[0]) - 1):
+        raise error.PyAsn1Error(
+            'Non-zero unused bits in BIT STRING encoding at %s' % (tagSet,))
+
 
 class AbstractPayloadDecoder(object):
     protoComponent = None
@@ -154,6 +194,7 @@ class IntegerPayloadDecoder(AbstractSimplePayloadDecoder):
                 yield chunk
 
         if chunk:
+            _rejectNonMinimalInteger(chunk, tagSet, options)
             value = int.from_bytes(bytes(chunk), 'big', signed=True)
 
         else:
@@ -164,6 +205,23 @@ class IntegerPayloadDecoder(AbstractSimplePayloadDecoder):
 
 class BooleanPayloadDecoder(IntegerPayloadDecoder):
     protoComponent = univ.Boolean(0)
+
+    def valueDecoder(self, substrate, asn1Spec,
+                     tagSet=None, length=None, state=None,
+                     decodeFun=None, substrateFun=None,
+                     **options):
+        if tagSet[0].tagFormat != tag.tagFormatSimple:
+            raise error.PyAsn1Error('Simple tag format expected')
+
+        for chunk in readFromStream(substrate, length, options):
+            if isinstance(chunk, SubstrateUnderrunError):
+                yield chunk
+
+        if chunk:
+            _rejectNonCanonicalBoolean(chunk, tagSet, options)
+
+        yield self._createComponent(
+            asn1Spec, tagSet, chunk and chunk[0] or 0, **options)
 
     def _createComponent(self, asn1Spec, tagSet, value, **options):
         return IntegerPayloadDecoder._createComponent(
@@ -251,6 +309,10 @@ class BitStringPayloadDecoder(AbstractSimplePayloadDecoder):
                 if isinstance(chunk, SubstrateUnderrunError):
                     yield chunk
 
+            if chunk:
+                _rejectNonZeroUnusedBits(
+                    bytes((trailingBits,)) + bytes(chunk), tagSet, options)
+
             value = self.protoComponent.fromOctetString(
                 chunk, internalFormat=True, padding=trailingBits)
 
@@ -261,6 +323,14 @@ class BitStringPayloadDecoder(AbstractSimplePayloadDecoder):
         if not self.supportConstructedForm:
             raise error.PyAsn1Error('Constructed encoding form prohibited '
                                     'at %s' % self.__class__.__name__)
+
+        if _isStrictDer(options):
+            # X.690 10.2 / 11.2: DER mandates the primitive form. The
+            # supportConstructedForm attribute only covers the schemaless
+            # path; the schema-driven TYPE_MAP path reaches here too.
+            raise error.PyAsn1Error(
+                'Constructed encoding form prohibited under strict DER '
+                'at %s' % self.__class__.__name__)
 
         if LOG:
             LOG('assembling constructed serialization')
@@ -358,6 +428,14 @@ class OctetStringPayloadDecoder(AbstractSimplePayloadDecoder):
 
         if not self.supportConstructedForm:
             raise error.PyAsn1Error('Constructed encoding form prohibited at %s' % self.__class__.__name__)
+
+        if _isStrictDer(options):
+            # X.690 10.2: DER mandates the primitive form for OCTET STRING
+            # and every restricted character string type. This catches the
+            # schema-driven TYPE_MAP path that the class attribute cannot.
+            raise error.PyAsn1Error(
+                'Constructed encoding form prohibited under strict DER '
+                'at %s' % self.__class__.__name__)
 
         if LOG:
             LOG('assembling constructed serialization')
@@ -675,6 +753,48 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
     def _getComponentPositionByType(self, asn1Object, tagSet, idx):
         raise NotImplementedError
 
+    @staticmethod
+    def _isSetContainer(tagSet, asn1Spec):
+        # The schemaless path only knows the wire tag; the schema-driven path
+        # can distinguish a SET from a SEQUENCE by the spec's typeId.
+        if asn1Spec is not None:
+            return asn1Spec.typeId in (univ.Set.typeId, univ.SetOf.typeId)
+
+        return tagSet[0].tagId == univ.Set.tagSet[0][2]
+
+    def _enforceSetOrdering(self, substrate, componentRanges, tagSet, options):
+        # X.690 11.6: SET and SET OF components shall appear in ascending
+        # order of their encoded values. With DER-canonical component
+        # encodings the lexicographic order of the complete TLV octets is
+        # exactly that order, so compare each component's raw encoding
+        # against the previous one instead of trusting the decoder to have
+        # reordered anything.
+        #
+        # Runs only after every component has fully decoded, so the whole
+        # region is present; readFromStream still mediates the access because
+        # a non-blocking substrate may answer an individual read with None,
+        # in which case re-reading with the same head simply retries.
+        if not _isStrictDer(options) or not componentRanges:
+            return
+
+        readHead = substrate.tell()
+        previous = None
+        for componentStart, componentEnd in componentRanges:
+            substrate.seek(componentStart, os.SEEK_SET)
+            for chunk in readFromStream(
+                    substrate, componentEnd - componentStart, options):
+                if isinstance(chunk, SubstrateUnderrunError):
+                    yield chunk
+            current = bytes(chunk)
+            if previous is not None and current < previous:
+                substrate.seek(readHead, os.SEEK_SET)
+                raise error.PyAsn1Error(
+                    'SET/SET OF components are not in DER ascending '
+                    'order at %s' % (tagSet,))
+            previous = current
+
+        substrate.seek(readHead, os.SEEK_SET)
+
     def _decodeComponentsSchemaless(
             self, substrate, tagSet=None, decodeFun=None,
             length=None, **options):
@@ -685,14 +805,23 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
         componentTypes = set()
 
         original_position = substrate.tell()
+        checkOrdering = (
+            _isStrictDer(options) and self._isSetContainer(tagSet, None))
+        componentRanges = []
 
         while length == -1 or substrate.tell() < original_position + length:
+            componentStart = substrate.tell()
+
             for component in decodeFun(substrate, **options):
                 if isinstance(component, SubstrateUnderrunError):
                     yield component
 
             if length == -1 and component is eoo.endOfOctets:
                 break
+
+            if checkOrdering:
+                componentRanges.append(
+                    (componentStart, substrate.tell()))
 
             components.append(component)
             # Two distinct types settle the choice; keep the set bounded
@@ -719,6 +848,11 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
         if LOG:
             LOG('guessed %r container type (pass `asn1Spec` to guide the '
                 'decoder)' % asn1Object)
+
+        if checkOrdering:
+            for underrun in self._enforceSetOrdering(
+                    substrate, componentRanges, tagSet, options):
+                yield underrun
 
         for idx, component in enumerate(components):
             asn1Object.setComponentByPosition(
@@ -792,7 +926,11 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
             seenIndices = set()
             idx = 0
+            checkOrdering = (
+                _isStrictDer(options) and self._isSetContainer(tagSet, asn1Spec))
+            componentRanges = []
             while substrate.tell() - original_position < length:
+                componentStart = substrate.tell()
                 if not namedTypes:
                     componentType = None
 
@@ -819,6 +957,10 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                     if isinstance(component, SubstrateUnderrunError):
                         yield component
 
+                if checkOrdering:
+                    componentRanges.append(
+                        (componentStart, substrate.tell()))
+
                 if not isDeterministic and namedTypes:
                     if isSetType:
                         idx = namedTypes.getPositionByType(component.effectiveTagSet)
@@ -834,6 +976,11 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
 
                 seenIndices.add(idx)
                 idx += 1
+
+            if checkOrdering:
+                for underrun in self._enforceSetOrdering(
+                        substrate, componentRanges, tagSet, options):
+                    yield underrun
 
             if LOG:
                 LOG('seen component indices %s' % seenIndices)
@@ -934,11 +1081,19 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                 LOG('decoding type %r chosen by given `asn1Spec`' % componentType)
 
             idx = 0
+            checkOrdering = (
+                _isStrictDer(options) and self._isSetContainer(tagSet, asn1Spec))
+            componentRanges = []
 
             while substrate.tell() - original_position < length:
+                componentStart = substrate.tell()
                 for component in decodeFun(substrate, componentType, **options):
                     if isinstance(component, SubstrateUnderrunError):
                         yield component
+
+                if checkOrdering:
+                    componentRanges.append(
+                        (componentStart, substrate.tell()))
 
                 asn1Object.setComponentByPosition(
                     idx, component,
@@ -947,6 +1102,11 @@ class ConstructedPayloadDecoderBase(AbstractConstructedPayloadDecoder):
                 )
 
                 idx += 1
+
+            if checkOrdering:
+                for underrun in self._enforceSetOrdering(
+                        substrate, componentRanges, tagSet, options):
+                    yield underrun
 
         yield asn1Object
 
@@ -1585,6 +1745,11 @@ class SingleItemDecoder(object):
 
     supportIndefLength = True
 
+    # When True, every decode runs the full DER conformance rule set unless a
+    # caller explicitly passes strictDER=False. Only the DER subclass flips
+    # this; BER/CER stay False and keep their legal lenient behavior.
+    strictDerMode = False
+
     TAG_MAP = TAG_MAP
     TYPE_MAP = TYPE_MAP
 
@@ -1609,6 +1774,18 @@ class SingleItemDecoder(object):
             )
 
         options['_nestingLevel'] = _nestingLevel + 1
+
+        if STRICT_DER_OPTION not in options:
+            # Default follows the dialect; an explicit strictDER keyword
+            # normalized in StreamingDecoder always wins. BER/CER keep the
+            # flag off entirely so their legal lenient encodings survive.
+            options[STRICT_DER_OPTION] = self.strictDerMode
+
+        elif not self.strictDerMode:
+            # The option can only switch strictness on for a decoder whose
+            # dialect implements it; ignore it on BER/CER rather than
+            # silently turning BER strict.
+            options[STRICT_DER_OPTION] = False
 
         allowEoo = options.pop('allowEoo', False)
 
@@ -1667,6 +1844,7 @@ class SingleItemDecoder(object):
                         isShortTag = False
                         tagOctetCount = 0
                         tagId = 0
+                        firstTagOctet = None
 
                         while True:
                             for integerByte in readFromStream(substrate, 1, options):
@@ -1679,6 +1857,8 @@ class SingleItemDecoder(object):
                                 )
 
                             integerTag = ord(integerByte)
+                            if firstTagOctet is None:
+                                firstTagOctet = integerTag
                             tagOctetCount += 1
                             if tagOctetCount > MAX_TAG_OCTETS:
                                 raise error.PyAsn1Error(
@@ -1690,6 +1870,15 @@ class SingleItemDecoder(object):
 
                             if not integerTag & 0x80:
                                 break
+
+                        if _isStrictDer(options):
+                            # X.690 8.1.2.4: tag numbers 0..30 must use the
+                            # short form, and the first long-form octet
+                            # cannot be zero (no redundant leading octet).
+                            if tagId < 0x1F or firstTagOctet == 0x80:
+                                raise error.PyAsn1Error(
+                                    'Non-minimal tag encoding for tag ID %s'
+                                    % (tagId,))
 
                     lastTag = tag.Tag(
                         tagClass=tagClass, tagFormat=tagFormat, tagId=tagId
@@ -1760,6 +1949,14 @@ class SingleItemDecoder(object):
                             'Length %d exceeds maximum readable size %d' % (
                                 length, sys.maxsize)
                         )
+
+                    if _isStrictDer(options):
+                        # X.690 10.1 / 8.1.3: lengths 0..127 use the short
+                        # form, and a long form shall not carry a leading
+                        # zero octet (0x81 0x7F, 0x82 0x00 0x80, ...).
+                        if length < 0x80 or encodedLength[0] == 0x00:
+                            raise error.PyAsn1Error(
+                                'Non-minimal length encoding at %s' % (tagSet,))
 
                 else:  # 128 means indefinite
                     length = -1
@@ -2044,6 +2241,14 @@ class StreamingDecoder(object):
     SINGLE_ITEM_DECODER = SingleItemDecoder
 
     def __init__(self, substrate, asn1Spec=None, **options):
+        # Normalize the public strict DER switch once, at the boundary, so
+        # every recursive decodeFun/open-type re-entry inherits it through
+        # the ordinary options channel. BER and CER StreamingDecoders accept
+        # the keyword but their payload codecs only act on it when their own
+        # SingleItemDecoder declares strictDerMode; the DER subclass does.
+        if 'strictDER' in options:
+            options[STRICT_DER_OPTION] = bool(options.pop('strictDER'))
+
         self._singleItemDecoder = self.SINGLE_ITEM_DECODER(**options)
         self._substrate = asSeekableStream(substrate)
         self._asn1Spec = asn1Spec
@@ -2094,6 +2299,15 @@ class Decoder(object):
             Depending on the ASN.1 structure being decoded, `asn1Spec` may or
             may not be required. Most common reason for it to require is that
             ASN.1 structure is encoded in *IMPLICIT* tagging mode.
+
+        strictDER: :py:class:`bool`
+            Opt in to, or out of, strict DER conformance checking. The DER
+            decoder defaults it to True and rejects non-canonical encodings
+            (non-minimal INTEGER/length/tag octets, non-canonical BOOLEAN,
+            non-zero unused BIT STRING bits, constructed string forms and
+            unordered SET/SET OF components) on every decode path; pass False
+            to restore the permissive legacy behavior. BER and CER accept the
+            keyword but ignore it, keeping their legal lenient decoding.
 
         substrateFun: :py:class:`Union[
                 Callable[[pyasn1.type.base.PyAsn1Item, bytes, int],

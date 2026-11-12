@@ -79,12 +79,18 @@ downstream callers depend on. Rationale in
   on. Conversely, registering a new type in the BER source is enough; only
   *runtime* mutation after import fails to propagate. Add to `cer/` or `der/`
   only when that codec needs different behavior.
-- **CER/DER decoder strictness does not fire on the schema-driven path**,
-  because the fully inherited `TYPE_MAP` is consulted before `TAG_MAP`
-  whenever an `asn1Spec` is supplied. DER's `supportConstructedForm=False` and
-  CER's canonical Boolean check are inert there; only
-  `supportIndefLength=False` is unconditional. Test strictness changes both
-  with and without a schema.
+- **CER/DER decoder strictness does not fire on the schema-driven path by
+  default**, because the fully inherited `TYPE_MAP` is consulted before
+  `TAG_MAP` whenever an `asn1Spec` is supplied. DER's
+  `supportConstructedForm=False` and CER's canonical Boolean check are inert
+  there; only `supportIndefLength=False` is unconditional. Strict DER mode
+  (`strictDerMode=True` on DER's `SingleItemDecoder`, reachable per call with
+  the `strictDER` keyword that `StreamingDecoder` normalizes into the
+  `STRICT_DER_OPTION` options key) applies the full X.690 rule set on both
+  paths; every check lives in `ber/decoder.py` gated on
+  `_isStrictDer(options)`, so BER and CER never tighten and
+  `strictDER=False` restores the legacy permissive DER decode. Test
+  strictness changes both with and without a schema.
 - **Do not weaken the decoder limits.** `MAX_OID_ARC_CONTINUATION_OCTETS`,
   `MAX_TAG_OCTETS`, `MAX_NESTING_DEPTH` and `MAX_LENGTH_OCTETS` sit at the top
   of `pyasn1/codec/ber/decoder.py`; the unnamed `length > sys.maxsize` guard

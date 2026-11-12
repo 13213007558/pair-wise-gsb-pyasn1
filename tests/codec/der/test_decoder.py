@@ -46,13 +46,26 @@ class BitStringDecoderTestCase(BaseTestCase):
             assert 0, 'chunked encoding tolerated'
 
     def testSchemaDrivenChunkedWithIntermediatePadding(self):
+        # Constructed BIT STRING is BER-legal but prohibited by strict DER;
+        # the historical permissive decode is reachable via strictDER=False.
         fragments = b'\x03\x02\x03\x10\x03\x02\x00\xa5'
         value, rest = decoder.decode(b'\x23\x08' + fragments,
-                                     asn1Spec=univ.BitString())
+                                     asn1Spec=univ.BitString(),
+                                     strictDER=False)
 
         assert value == univ.BitString(binValue='0001010100101')
         assert len(value) == 13
         assert rest == b''
+
+    def testSchemaDrivenChunkedRejectedUnderStrictDer(self):
+        fragments = b'\x03\x02\x03\x10\x03\x02\x00\xa5'
+        try:
+            decoder.decode(b'\x23\x08' + fragments,
+                           asn1Spec=univ.BitString())
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed BIT STRING tolerated under strict DER'
 
 
 class OctetStringDecoderTestCase(BaseTestCase):
@@ -82,19 +95,43 @@ class OctetStringDecoderTestCase(BaseTestCase):
             assert 0, 'chunked encoding tolerated'
 
     def testSchemaDrivenManyFragments(self):
+        # Constructed OCTET STRING is BER-legal but prohibited by strict DER;
+        # the historical permissive decode is reachable via strictDER=False.
         fragments = b'\x04\x01A' * 64
         value, rest = decoder.decode(b'\x24\x81\xc0' + fragments,
-                                     asn1Spec=univ.OctetString())
+                                     asn1Spec=univ.OctetString(),
+                                     strictDER=False)
 
         assert value.asOctets() == b'A' * 64
         assert rest == b''
 
+    def testSchemaDrivenManyFragmentsRejectedUnderStrictDer(self):
+        fragments = b'\x04\x01A' * 64
+        try:
+            decoder.decode(b'\x24\x81\xc0' + fragments,
+                           asn1Spec=univ.OctetString())
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed OCTET STRING tolerated under strict DER'
+
     def testConstructedCharacterString(self):
+        # Schemaless legacy tolerance; strict DER must reject the same bytes.
         fragments = b'\x0c\x01A' * 64
-        value, rest = decoder.decode(b'\x2c\x81\xc0' + fragments)
+        value, rest = decoder.decode(b'\x2c\x81\xc0' + fragments,
+                                     strictDER=False)
 
         assert value == char.UTF8String(b'A' * 64)
         assert rest == b''
+
+    def testConstructedCharacterStringRejectedUnderStrictDer(self):
+        fragments = b'\x0c\x01A' * 64
+        try:
+            decoder.decode(b'\x2c\x81\xc0' + fragments)
+        except PyAsn1Error:
+            pass
+        else:
+            assert 0, 'constructed character string tolerated under strict DER'
 
 
 class LargeTagDecoderTestCase(BaseTestCase):

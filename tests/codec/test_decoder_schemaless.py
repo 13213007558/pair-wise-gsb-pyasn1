@@ -25,6 +25,11 @@ class SchemalessContainerDecoderTestCase(BaseTestCase):
         ('ber-indef', ber_decoder, True),
         ('cer-def', cer_decoder, False),
         ('cer-indef', cer_decoder, True),
+        # The deliberately unordered and non-canonical fixtures below are
+        # BER-legal but not DER-canonical; opt out of the DER codec's strict
+        # mode so this module keeps exercising its permissive legacy path.
+        # Strict DER behavior has its own cases in
+        # tests/codec/test_strict_der.py.
         ('der', der_decoder, False),
     )
     containers = (
@@ -67,6 +72,12 @@ class SchemalessContainerDecoderTestCase(BaseTestCase):
         return univ.OctetString.tagSet.tagExplicitly(
             tag.Tag(tag.tagClassContext, tag.tagFormatConstructed, tagId))
 
+    def _decode(self, decoder_module, substrate):
+        options = {}
+        if decoder_module is der_decoder:
+            options['strictDER'] = False
+        return decoder_module.decode(substrate, **options)
+
     def _assertValue(self, value, expectedType, tagIds):
         assert type(value) is expectedType
         assert len(value) == len(tagIds)
@@ -83,8 +94,8 @@ class SchemalessContainerDecoderTestCase(BaseTestCase):
             name, decoder, indefinite = codec
             containerTag, sequenceType, recordType = container
             with self.subTest(codec=name, container=sequenceType, tags=tagIds):
-                value, tail = decoder.decode(
-                    self._substrate(containerTag, tagIds, indefinite))
+                value, tail = self._decode(
+                    decoder, self._substrate(containerTag, tagIds, indefinite))
                 self._assertValue(value, sequenceType, tagIds)
                 assert tail == b''
 
@@ -95,8 +106,8 @@ class SchemalessContainerDecoderTestCase(BaseTestCase):
             name, decoder, indefinite = codec
             containerTag, sequenceType, recordType = container
             with self.subTest(codec=name, container=recordType, tags=tagIds):
-                value, tail = decoder.decode(
-                    self._substrate(containerTag, tagIds, indefinite))
+                value, tail = self._decode(
+                    decoder, self._substrate(containerTag, tagIds, indefinite))
                 self._assertValue(value, recordType, tagIds)
                 assert tail == b''
 
@@ -128,7 +139,7 @@ class SchemalessContainerDecoderTestCase(BaseTestCase):
 
                 tag.TagSet.__eq__ = countedEq
                 try:
-                    value, tail = decoder.decode(substrate)
+                    value, tail = self._decode(decoder, substrate)
                 finally:
                     tag.TagSet.__eq__ = originalEq
 
@@ -158,7 +169,11 @@ class SchemalessContainerDecoderTestCase(BaseTestCase):
                 substrate = self._substrate(
                     containerTag, tagIds, indefinite, definiteTags=True)
                 stream = NonBlockingStream()
-                iterator = iter(decoder.StreamingDecoder(stream))
+                streamOptions = {}
+                if decoder is der_decoder:
+                    streamOptions['strictDER'] = False
+                iterator = iter(
+                    decoder.StreamingDecoder(stream, **streamOptions))
                 supplied = 0
                 underruns = 0
                 while True:

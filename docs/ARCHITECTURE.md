@@ -926,7 +926,11 @@ in a map. Removing the `typeId not in TYPE_MAP` guard from the derived
 backfill loops looks like a cleanup but would newly route schema-driven
 CER/DER decodes through the strict subclasses, breaking every caller that
 currently (if accidentally) relies on DER accepting constructed OCTET STRINGs
-under a schema.
+under a schema. Strict DER mode ([Strict DER
+mode](#strict-der-mode)) solves the same gap explicitly and opt-in: rather
+than mutating the inherited maps, it carries a flag through the options
+channel that the shared BER payload decoders consult on both paths, leaving
+this default behavior intact.
 
 Registration history has also left dead weight in the maps. The module-level
 `TAG_MAP.update({...})` block in `cer/encoder.py` registers
@@ -1011,6 +1015,67 @@ subclasses, `BitStringPayloadDecoder` and `OctetStringPayloadDecoder`, setting
 `supportIndefLength = False` on its `SingleItemDecoder`; how that one
 attribute shuts indefinite framing off entirely is covered in [Two framing
 modes](#two-framing-modes).
+
+### Strict DER mode
+
+The dialect attributes above only fire on the schemaless tag-driven path:
+the schema-driven `TYPE_MAP` lookup returns BER's permissive payload
+decoders, so a non-canonical INTEGER, a `0x01` BOOLEAN or a constructed
+OCTET STRING supplied with an `asn1Spec` decodes where the same bytes
+without one raise. Strict DER mode closes that gap without touching any
+shared decoder instance. It is opt-in per call through the `strictDER`
+keyword, normalized once in `StreamingDecoder.__init__` into the
+`STRICT_DER_OPTION` (`_strictDER`) key of the options dict; the flag then
+rides the same channel as `_nestingLevel`, so every recursive `decodeFun`,
+explicit/implicit tag, CHOICE and open-type re-decode inherits it with no
+extra plumbing ([The options channel](#the-options-channel)). The DER
+`SingleItemDecoder` declares `strictDerMode = True`, defaulting the flag on
+for that dialect only; BER and CER leave it `False`, and
+`SingleItemDecoder.__call__` forces the flag off for a decoder whose mode
+is `False`, so passing `strictDER=True` to the BER codec never tightens
+BER. `strictDER=False` on the DER codec restores the historical permissive
+behavior, which the legacy constructed-string fixtures in
+`tests/codec/der/test_decoder.py` and the unordered hash-collision fixtures
+in `tests/codec/test_decoder_schemaless.py` rely on.
+
+Every conformance check lives in `ber/decoder.py`, gated on
+`_isStrictDer(options)`, so BER's legal lenient encodings are byte-for-byte
+unchanged when the flag is absent. The rules, each citing X.690:
+
+- minimal INTEGER/ENUMERATED contents — no redundant leading `0x00`/`0xFF`
+  (`_rejectNonMinimalInteger`, called from `IntegerPayloadDecoder`);
+- canonical BOOLEAN — only `0x00`/`0xFF`
+  (`_rejectNonCanonicalBoolean`, called from the BER
+  `BooleanPayloadDecoder`, which is the class the schema-driven TYPE_MAP
+  actually dispatches to);
+- zero unused BIT STRING bits (`_rejectNonZeroUnusedBits`);
+- primitive-only OCTET STRING and restricted character strings, and
+  primitive-only BIT STRING — the constructed-form checks in
+  `OctetStringPayloadDecoder.valueDecoder` and
+  `BitStringPayloadDecoder.valueDecoder` that the `supportConstructedForm`
+  attribute cannot reach on the schema path;
+- minimal identifier octets — tag numbers below 31 use the short form and a
+  long form has no leading `0x80` — and minimal length octets — values under
+  128 use the short form and a long form has no leading zero — both in the
+  `stDecodeTag`/`stDecodeLength` states of `SingleItemDecoder.__call__`;
+- SET/SET OF component ordering (`ConstructedPayloadDecoderBase._enforceSetOrdering`),
+  applied on both the schema and schemaless paths. The component decode
+  loops record `(start, end)` stream ranges; after all components have
+  decoded (so the region is fully present) the helper re-reads each complete
+  TLV through `readFromStream` — never a bare `substrate.read`, which a
+  non-blocking stream answers with `None` — and asserts lexicographic
+  ascent, the X.690 11.6 order for canonical component encodings. It is a
+  generator that yields `SubstrateUnderrunError` like every other payload
+  reader, so partial input still suspends and resumes rather than raising.
+
+The pre-existing limits (`MAX_NESTING_DEPTH`, `MAX_TAG_OCTETS`,
+`MAX_LENGTH_OCTETS`, `MAX_OID_ARC_CONTINUATION_OCTETS`) are unconditional
+and unchanged: strict mode adds conformance rules beside them, never
+replaces them, and every rejection raises the public `PyAsn1Error` rather
+than a new exception type. The executable differential — same non-canonical
+bytes accepted by BER, rejected by strict DER on both paths, with the
+canonical round-trip still accepted — is
+`tests/codec/test_strict_der.py`.
 
 ### Configuration surfaces
 

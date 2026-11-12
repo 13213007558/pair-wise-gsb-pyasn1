@@ -1,6 +1,21 @@
 Revision 0.7.0, released XX-XX-2026
 ---------------------------------------
 
+- Added an opt-in strict DER decoding mode. The DER codec now accepts a
+  ``strictDER`` keyword (default on for ``pyasn1.codec.der``) that enforces
+  the full X.690 DER conformance rule set on both the schema-driven and
+  schemaless decode paths: minimal INTEGER/ENUMERATED and length octets,
+  canonical BOOLEAN truth values, zero unused BIT STRING bits, prohibition of
+  constructed OCTET/character/BIT STRING forms, minimal tag encoding and
+  ascending SET/SET OF component order. Previously these rules only fired on
+  the schemaless ``TAG_MAP`` path, so a non-canonical encoding supplied with
+  an ``asn1Spec`` (including nested explicit/implicit tags, CHOICE and open
+  types) was tolerated. The checks ride the decoder options channel and never
+  mutate the shared BER decoder instances, so BER and CER keep their legal
+  lenient behavior and ``strictDER=False`` restores the historical DER
+  decode. Existing nesting, tag, length and OID limits and the
+  ``PyAsn1Error`` exception contract are unchanged; partial input still
+  suspends and resumes through the streaming protocol.
 - Fixed OverflowError from BER/CER/DER length values that fit in the
   supported 8-octet length field but exceed the platform maximum readable
   size. Such oversized definite lengths are now rejected with PyAsn1Error.

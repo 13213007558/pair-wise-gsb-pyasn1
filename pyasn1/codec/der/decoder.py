@@ -48,6 +48,11 @@ class SingleItemDecoder(decoder.SingleItemDecoder):
 
     supportIndefLength = False
 
+    # Full DER conformance (X.690 section 10/11) on both the tag-driven and
+    # schema-driven decode paths. Callers that need the historical permissive
+    # behavior can opt out per call with strictDER=False.
+    strictDerMode = True
+
 
 class StreamingDecoder(decoder.StreamingDecoder):
     __doc__ = decoder.StreamingDecoder.__doc__
